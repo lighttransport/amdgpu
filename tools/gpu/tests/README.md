@@ -22,7 +22,10 @@ in temporary directories. UBSan violations are fatal.
   dumps and after queue reset; real scheduler timeout/completion bookkeeping,
   pending-job ownership, retained callbacks/later cleanup, racing completion,
   a later bus drop, healthy-device
-  recovery, and unchanged VF behavior. The old driver fails the first
+  recovery, and unchanged VF behavior. Workqueue stop/start and free-work
+  gating now use extracted real helpers. Deterministic in-flight completion
+  and timer requeue injections check stop-before-reinsertion and cancel
+  ordering; a two-job case checks list order, callbacks and cleanup. The old driver fails the first
   assertion by entering hardware recovery against an inaccessible PF.
 
 These tests do not validate kernel locking, real firmware/power sequencing,

@@ -143,3 +143,47 @@ and amdgpu_drv.c. Existing unrelated warnings remain; BTF was skipped
 without vmlinux. All six driver regression suites pass, including the new
 scheduler/PCI test. No installed sources/modules, live resets, power
 settings or reboot were changed during this follow-up.
+
+
+Guard pre-push review, 2026-10-31
+--------------------------------
+
+The live fork remote was read again: LTE branch tip remains
+``1636034a604c7bb56d54a82d29ee99446d559750``. The unpublished guard commit
+is ``3521cd26c14354854f5fe20544815f729bf7c7e6``. The review found no new
+blocking defect in that driver change. In particular, worker cancellation
+precedes guilty-job reinsertion, parent callbacks remain attached, the
+queued timeout is canceled under the list lock, and the ENODEV return
+skips wrapper reinsertion/rearm. Normal full-reset resume starts the same
+workqueues; no timeout or permanent-unplug state was changed.
+
+The previous regression mocked workqueue stop/start as flag toggles and
+used one pending job. The strengthened test extracts the actual stop/start,
+stopped-state and free-queue helpers. Low-level workqueue mocks inject a
+completion and a queued timer while stop waits for in-flight work. It also
+covers two pending jobs, preserved order/parent callbacks, score/credit
+accounting, and exactly-once cleanup after restart. Removing timer cancel,
+reinserting before worker stop, or detaching the parent each makes the
+new regression fail. All six offline driver suites pass with fatal UBSan.
+These are deterministic interleavings, not real kernel concurrency tests.
+
+A separate Pearl integration finding was fixed: post-reboot verification
+could accept matching old loaded/on-disk LTE modules when a stale DKMS
+registration claimed the new version installed. Verification now requires
+nonempty matching srcversion identities for the pinned DKMS build, module
+on disk and loaded module. Reproduced old-verifier acceptance and confirmed
+new-verifier rejection; all seventeen isolated script tests pass.
+
+No driver C source changed during this review. The previous full
+``7.0.0-42-generic`` build remains valid for the thirteen byte-matched
+sources (allowing the vendor's CONFIG renaming), with nine modules and no
+warnings in amdgpu_job.c. The test-only follow-up does not require another
+full rebuild. Driver diff checkpatch and whitespace checks pass.
+
+Residual scope: PCI access can fail after either probe; explicit fault
+interrupts can call drm_sched_fault() even while submission is paused.
+This guard cancels ordinary pending timeout work and suppresses the
+callback wrapper's rearm, not every external trigger or all device MMIO.
+PCI error recovery/PM concurrency, real reset/rebind, firmware timing and
+hardware stability remain unvalidated. No push, install, live reset or
+reboot was performed during the audit.

@@ -3137,7 +3137,7 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 					ret, limit);
 				return -EIO;
 			}
-		} else if (abs((int)held - (int)limit) > (int)(limit / 25) + 1) {
+		} else if ((held > limit ? held - limit : limit - held) > limit / 25 + 1) {
 			amdgpu_lte_ppt_trace(smu->adev, "mismatch", limit_type, limit,
 					     min_limit, max_limit, held, -EIO);
 			dev_err(smu->adev->dev,

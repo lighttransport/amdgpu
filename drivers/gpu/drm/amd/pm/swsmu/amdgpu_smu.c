@@ -23,6 +23,7 @@
 #define SWSMU_CODE_LAYER_L1
 
 #include <linux/firmware.h>
+#include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
@@ -60,6 +61,26 @@
 #undef pr_warn
 #undef pr_info
 #undef pr_debug
+
+/* Experimental Navi 48 PPT floor override; stock policy unless opted in. */
+static unsigned int amdgpu_smu_min_power_cap;
+module_param_named(min_power_cap, amdgpu_smu_min_power_cap, uint, 0444);
+MODULE_PARM_DESC(min_power_cap,
+		 "Navi 48 minimum PPT cap in watts (0 = SKU minimum; experimental, may hang GPU)");
+
+static u32 smu_min_ppt_limit(struct smu_context *smu, u32 limit_type,
+			     u32 min_limit)
+{
+	struct amdgpu_device *adev = smu->adev;
+
+	if (!amdgpu_smu_min_power_cap || smu->is_apu || amdgpu_sriov_vf(adev) ||
+	    limit_type != SMU_DEFAULT_PPT_LIMIT ||
+	    amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(12, 0, 1) ||
+	    amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 2))
+		return min_limit;
+
+	return min_t(u32, amdgpu_smu_min_power_cap, min_limit);
+}
 
 static const struct amd_pm_funcs swsmu_pm_funcs;
 static int smu_force_smuclk_levels(struct smu_context *smu,
@@ -3027,6 +3048,7 @@ int smu_get_ppt_limit(void *handle,
 		*limit = smu->od_enabled ?
 			smu->ppt_limits.range[power_source][limit_type].od_min :
 			smu->ppt_limits.range[power_source][limit_type].min;
+		*limit = smu_min_ppt_limit(smu, limit_type, *limit);
 		break;
 	default:
 		return -EINVAL;
@@ -3052,6 +3074,7 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 		SMU_POWER_SOURCE_AC : SMU_POWER_SOURCE_DC;
 	range = &smu->ppt_limits.range[power_source][limit_type];
 	min_limit = smu->od_enabled ? range->od_min : range->min;
+	min_limit = smu_min_ppt_limit(smu, limit_type, min_limit);
 	max_limit = smu->od_enabled ? range->od_max : range->max;
 
 	if (!(smu->ppt_limits.supported_mask & BIT(limit_type)))

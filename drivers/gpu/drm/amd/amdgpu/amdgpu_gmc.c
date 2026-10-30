@@ -404,13 +404,14 @@ void amdgpu_gmc_set_agp_default(struct amdgpu_device *adev,
 }
 
 /**
- * amdgpu_gmc_fault_key - get hash key from vm fault address, PASID and hub
+ * amdgpu_gmc_fault_key - get hash key from address, PASID and source
  *
- * @addr: 48 bit physical address, page aligned
+ * @addr: up to 57 bit GPU virtual address, page aligned
  * @pasid: 16 bit process address space identifier
- * @hub: vmhub id the fault came from (AMDGPU_GFXHUB(x)/AMDGPU_MMHUBx(x); 4 bits)
+ * @vmid_src: one-bit IH VMID source (GFXHUB or MMHUB domain)
  *
- * Layout: [63:20] page number | [19:4] pasid | [3:0] hub.
+ * Layout: [61:17] page number | [16:1] pasid | [0] VMID source.
+ * Packing the source bit, rather than four hub bits, preserves address bit 56.
  *
  * The hub has to participate in the key: a gfxhub and a mmhub fault on the
  * same address and PASID must be dedupe-separated, otherwise only the first
@@ -418,11 +419,11 @@ void amdgpu_gmc_set_agp_default(struct amdgpu_device *adev,
  * dropped for the whole AMDGPU_GMC_FAULT_TIMEOUT window.
  */
 static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid,
-					    uint32_t hub)
+					    uint32_t vmid_src)
 {
-	return ((addr >> AMDGPU_GPU_PAGE_SHIFT) << 20) |
-	       ((uint64_t)pasid << 4) |
-	       (hub & 0xF);
+	return ((addr >> AMDGPU_GPU_PAGE_SHIFT) << 17) |
+	       ((uint64_t)pasid << 1) |
+	       (vmid_src & 1);
 }
 
 /**
@@ -433,7 +434,7 @@ static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid,
  * @addr: address of the VM fault
  * @pasid: PASID of the process causing the fault
  * @timestamp: timestamp of the fault
- * @hub: vmhub id the fault came from (dedupe key component)
+ * @vmid_src: one-bit IH VMID source (dedupe key component)
  *
  * Returns:
  * True if the fault was filtered and should not be processed further.
@@ -442,10 +443,10 @@ static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid,
 bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
 			      struct amdgpu_ih_ring *ih, uint64_t addr,
 			      uint16_t pasid, uint64_t timestamp,
-			      uint32_t hub)
+			      uint32_t vmid_src)
 {
 	struct amdgpu_gmc *gmc = &adev->gmc;
-	uint64_t stamp, key = amdgpu_gmc_fault_key(addr, pasid, hub);
+	uint64_t stamp, key = amdgpu_gmc_fault_key(addr, pasid, vmid_src);
 	struct amdgpu_gmc_fault *fault;
 	uint32_t hash;
 
@@ -510,9 +511,8 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
  * Remove the address from fault filter, then future vm fault on this address
  * will pass to retry fault handler to recover.
  *
- * The stored dedupe key includes the vmhub the fault came from; the caller
- * does not know which hub faulted, so prune the entries for every possible
- * hub id.
+ * The stored key includes the one-bit IH VMID source; the caller does
+ * not know which source faulted, so expire entries for both source domains.
  */
 void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 				     uint16_t pasid)
@@ -523,7 +523,7 @@ void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 	uint32_t last_wptr;
 	uint64_t last_ts;
 	uint64_t tmp;
-	uint32_t hub;
+	uint32_t vmid_src;
 
 	if (adev->irq.retry_cam_enabled)
 		return;
@@ -541,8 +541,8 @@ void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 	/* Get the timetamp of the last entry in IH ring */
 	last_ts = amdgpu_ih_decode_iv_ts(adev, ih, last_wptr, -1);
 
-	for (hub = 0; hub <= 0xF; hub++) {
-		uint64_t key = amdgpu_gmc_fault_key(addr, pasid, hub);
+	for (vmid_src = 0; vmid_src < 2; vmid_src++) {
+		uint64_t key = amdgpu_gmc_fault_key(addr, pasid, vmid_src);
 		uint32_t hash = hash_64(key, AMDGPU_GMC_FAULT_HASH_ORDER);
 
 		fault = &gmc->fault_ring[gmc->fault_hash[hash].idx];

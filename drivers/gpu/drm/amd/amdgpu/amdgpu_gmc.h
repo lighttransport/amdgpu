@@ -432,7 +432,7 @@ void amdgpu_gmc_set_agp_default(struct amdgpu_device *adev,
 bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
 			      struct amdgpu_ih_ring *ih, uint64_t addr,
 			      uint16_t pasid, uint64_t timestamp,
-			      uint32_t hub);
+			      uint32_t vmid_src);
 void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 				     uint16_t pasid);
 int amdgpu_gmc_handle_retry_fault(struct amdgpu_device *adev,

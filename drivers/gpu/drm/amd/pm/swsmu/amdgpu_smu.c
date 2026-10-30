@@ -3072,6 +3072,37 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 	ret = smu->ppt_funcs->set_ppt_limit(smu, limit_type, limit);
 	if (ret)
 		return ret;
+
+	/*
+	 * LTE hardening: verify that the PMFW holds the limit we just set.
+	 * The firmware has been observed to accept a SetPowerLimit message
+	 * outside its validated range without failing it and to misbehave
+	 * afterwards, so detect silent acceptance: read the limit back and
+	 * fail the write if it is not what was requested (small relative
+	 * slack allowed for firmware rounding).
+	 */
+	if (smu->ppt_funcs->get_ppt_limit) {
+		u32 held;
+
+		ret = smu_get_asic_ppt_limit(smu, limit_type, &held);
+		if (ret) {
+			/* Asics that cannot read a limit back (e.g. a PPT1
+			 * implementation returning -EOPNOTSUPP) keep the old
+			 * behavior; only refuse a write we can verify.
+			 */
+			if (ret != -EOPNOTSUPP && ret != -ENOTSUPP) {
+				dev_err(smu->adev->dev,
+					"PPT limit read-back failed (%d) after setting limit %u\n",
+					ret, limit);
+				return -EIO;
+			}
+		} else if (abs((int)held - (int)limit) > (int)(limit / 25) + 1) {
+			dev_err(smu->adev->dev,
+				"PPT limit read-back mismatch: set %u, firmware holds %u; refusing the write\n",
+				limit, held);
+			return -EIO;
+		}
+	}
 	if (!(smu->user_dpm_profile.flags & SMU_DPM_USER_PROFILE_RESTORE)) {
 		smu->user_dpm_profile.ppt_limits[power_source][limit_type] = limit;
 		smu->user_dpm_profile.ppt_limit_user_mask[power_source] |=

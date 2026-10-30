@@ -2940,6 +2940,7 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
 	struct amdgpu_device *adev = drm_to_adev(drm_dev);
+	enum switch_power_state old_power_state = drm_dev->switch_power_state;
 	int ret, i;
 
 	ret = amdgpu_pmops_runtime_checks(dev);
@@ -2973,14 +2974,10 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 
 	ret = amdgpu_device_prepare(drm_dev);
 	if (ret)
-		return ret;
+		goto out;
 	ret = amdgpu_device_suspend(drm_dev, false);
-	if (ret) {
-		adev->in_runpm = false;
-		if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
-			adev->mp1_state = PP_MP1_STATE_NONE;
-		return ret;
-	}
+	if (ret)
+		goto out;
 
 	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
 		adev->mp1_state = PP_MP1_STATE_NONE;
@@ -3004,6 +3001,12 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 	dev_dbg(&pdev->dev, "asic/device is runtime suspended\n");
 
 	return 0;
+out:
+	adev->in_runpm = false;
+	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
+		adev->mp1_state = PP_MP1_STATE_NONE;
+	drm_dev->switch_power_state = old_power_state;
+	return ret;
 }
 
 static void amdgpu_restore_umd_profile_pstate_after_runpm(struct amdgpu_device *adev)

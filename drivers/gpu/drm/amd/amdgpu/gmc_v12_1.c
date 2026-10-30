@@ -180,7 +180,8 @@ static int gmc_v12_1_process_interrupt(struct amdgpu_device *adev,
 			/* Process it onyl if it's the first fault for this address */
 			if (entry->ih != &adev->irq.ih_soft &&
 				amdgpu_gmc_filter_faults(adev, entry->ih, addr, entry->pasid,
-							 entry->timestamp))
+							 entry->timestamp,
+							 entry->vmid_src))
 				return 1;
 
 			/* Delegate it to a different ring if the hardware hasn't

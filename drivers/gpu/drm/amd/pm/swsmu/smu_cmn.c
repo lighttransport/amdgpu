@@ -23,6 +23,7 @@
 #define SWSMU_CODE_LAYER_L4
 
 #include <linux/delay.h>
+#include <linux/moduleparam.h>
 
 #include "amdgpu.h"
 #include "amdgpu_smu.h"
@@ -66,15 +67,11 @@ static const char * const __smu_message_names[] = {
  */
 #define SMU_MSG_V1_BUSY_RETRIES		3
 
-/*
- * LTE hardening: fail fast after this many consecutive -ETIME polls. The
- * default wait per poll is usec_timeout * 20 (seconds-scale); a firmware
- * that answers nothing keeps the driver and its callers (suspend/resume,
- * PSP/MES teardown) cycling through those waits and cascading into
- * secondary failures. Marking SMU_FW_HANG after N timeouts makes all
- * following messages fail fast with -EREMOTEIO.
- */
-#define SMU_MSG_V1_ETIME_STREAK_LIMIT	3
+/* Zero disables timeout escalation; read-only to keep a streak's policy fixed. */
+static unsigned int smu_etime_streak = 3;
+module_param_named(smu_etime_streak, smu_etime_streak, uint, 0444);
+MODULE_PARM_DESC(smu_etime_streak,
+		 "Consecutive SMU response timeouts before fail-fast (default 3, 0 disables)");
 
 static const char *smu_get_message_name(struct smu_context *smu,
 					enum smu_message_type type)
@@ -342,6 +339,7 @@ static void __smu_msg_v1_send(struct smu_msg_ctl *ctl, u16 index,
 		arg = i < args->num_args ? args->args[i] : 0;
 		WREG32(cfg->arg_regs[i], arg);
 	}
+	ctl->last_msg = args->msg;
 	WREG32(cfg->msg_reg, index);
 }
 
@@ -435,31 +433,25 @@ static void __smu_msg_v1_print_error(struct smu_msg_ctl *ctl,
 	}
 }
 
-/*
- * LTE hardening: track consecutive response timeouts. A single -ETIME is
- * reported as usual; when the firmware stops answering entirely, escalate to
- * SMU_FW_HANG after SMU_MSG_V1_ETIME_STREAK_LIMIT consecutive timeouts, so
- * later messages fail fast instead of each waiting the full (seconds-scale)
- * default timeout and cascading into PSP/MES teardown errors.
- */
+/* Called with ctl->lock held, including the split asynchronous wait path. */
 static void __smu_msg_v1_etime_track(struct smu_msg_ctl *ctl, int ret)
 {
 	struct smu_context *smu = ctl->smu;
 	struct amdgpu_device *adev = smu->adev;
 
-	if (ret != -ETIME) {
+	if (ret != -ETIME || !smu_etime_streak) {
 		ctl->timeout_streak = 0;
 		return;
 	}
 
-	if (++ctl->timeout_streak < SMU_MSG_V1_ETIME_STREAK_LIMIT)
+	if (++ctl->timeout_streak < smu_etime_streak)
 		return;
 
-	ctl->timeout_streak = 0;
 	smu->smc_fw_state = SMU_FW_HANG;
-	dev_err(adev->dev,
-		"SMU: %d consecutive response timeouts; marking SMU firmware as hanged, subsequent messages will fail fast\n",
-		SMU_MSG_V1_ETIME_STREAK_LIMIT);
+	dev_err(smu->adev->dev,
+		"SMU: %u consecutive response timeouts; last message %s, msg_reg: 0x%x; marking firmware as hanged\n",
+		ctl->timeout_streak, smu_get_message_name(smu, ctl->last_msg),
+		RREG32(ctl->config.msg_reg));
 }
 
 static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
@@ -555,15 +547,17 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	} else if (smu->smc_fw_state == SMU_FW_INIT) {
 		skip_pre_poll = true;
 		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
+		ctl->last_msg = SMU_MSG_MAX_COUNT;
 	}
 
 	/* Pre-poll: ensure previous message completed */
 	if (!skip_pre_poll) {
 		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
 		ret = smu_msg_v1_decode_response(reg);
+		__smu_msg_v1_etime_track(ctl, ret);
 		if (reg == SMU_RESP_NONE || ret == -EREMOTEIO) {
 			__smu_msg_v1_print_error(ctl, reg, args);
-			__smu_msg_v1_etime_track(ctl, ret);
 			goto out;
 		}
 	}
@@ -600,8 +594,9 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		__smu_msg_v1_print_error(ctl, reg, args);
 	} else if (ret != 0) {
 		__smu_msg_v1_print_error(ctl, reg, args);
-		__smu_msg_v1_etime_track(ctl, ret);
 	}
+	if (!(args->flags & SMU_MSG_FLAG_ASYNC))
+		__smu_msg_v1_etime_track(ctl, ret);
 
 	/* Read output args */
 	if ((ret == 0 || (args->flags & SMU_MSG_FLAG_FORCE_READ_ARG)) &&
@@ -646,6 +641,9 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 	struct amdgpu_device *adev = smu->adev;
 	u32 reg;
 	int ret;
+
+	if (smu->smc_fw_state == SMU_FW_HANG)
+		return -EREMOTEIO;
 
 	reg = __smu_msg_v1_poll_stat(ctl, timeout_us);
 	ret = smu_msg_v1_decode_response(reg);

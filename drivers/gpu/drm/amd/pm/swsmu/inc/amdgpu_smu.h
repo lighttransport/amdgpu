@@ -707,7 +707,8 @@ struct smu_msg_ctl {
 	const struct cmn2asic_msg_mapping *message_map;
 	u32 default_timeout;
 	u32 flags;
-	int timeout_streak;
+	u32 timeout_streak;
+	enum smu_message_type last_msg;
 };
 
 struct stb_context {

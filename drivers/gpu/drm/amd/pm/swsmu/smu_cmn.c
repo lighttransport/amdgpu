@@ -22,6 +22,8 @@
 
 #define SWSMU_CODE_LAYER_L4
 
+#include <linux/delay.h>
+
 #include "amdgpu.h"
 #include "amdgpu_smu.h"
 #include "smu_cmn.h"
@@ -55,6 +57,24 @@ static const char * const __smu_message_names[] = {
 
 #define SMU_MSG_V1_DEFAULT_RATELIMIT_INTERVAL (5 * HZ)
 #define SMU_MSG_V1_DEFAULT_RATELIMIT_BURST 10
+
+/*
+ * LTE hardening: bounded retry for SMU_RESP_BUSY_OTHER ("I'm very busy"),
+ * whose documented client behavior is to retry in 10 us. A single busy
+ * response must not fail a power/clock write while the PMFW is making a
+ * transition.
+ */
+#define SMU_MSG_V1_BUSY_RETRIES		3
+
+/*
+ * LTE hardening: fail fast after this many consecutive -ETIME polls. The
+ * default wait per poll is usec_timeout * 20 (seconds-scale); a firmware
+ * that answers nothing keeps the driver and its callers (suspend/resume,
+ * PSP/MES teardown) cycling through those waits and cascading into
+ * secondary failures. Marking SMU_FW_HANG after N timeouts makes all
+ * following messages fail fast with -EREMOTEIO.
+ */
+#define SMU_MSG_V1_ETIME_STREAK_LIMIT	3
 
 static const char *smu_get_message_name(struct smu_context *smu,
 					enum smu_message_type type)
@@ -415,6 +435,33 @@ static void __smu_msg_v1_print_error(struct smu_msg_ctl *ctl,
 	}
 }
 
+/*
+ * LTE hardening: track consecutive response timeouts. A single -ETIME is
+ * reported as usual; when the firmware stops answering entirely, escalate to
+ * SMU_FW_HANG after SMU_MSG_V1_ETIME_STREAK_LIMIT consecutive timeouts, so
+ * later messages fail fast instead of each waiting the full (seconds-scale)
+ * default timeout and cascading into PSP/MES teardown errors.
+ */
+static void __smu_msg_v1_etime_track(struct smu_msg_ctl *ctl, int ret)
+{
+	struct smu_context *smu = ctl->smu;
+	struct amdgpu_device *adev = smu->adev;
+
+	if (ret != -ETIME) {
+		ctl->timeout_streak = 0;
+		return;
+	}
+
+	if (++ctl->timeout_streak < SMU_MSG_V1_ETIME_STREAK_LIMIT)
+		return;
+
+	ctl->timeout_streak = 0;
+	smu->smc_fw_state = SMU_FW_HANG;
+	dev_err(adev->dev,
+		"SMU: %d consecutive response timeouts; marking SMU firmware as hanged, subsequent messages will fail fast\n",
+		SMU_MSG_V1_ETIME_STREAK_LIMIT);
+}
+
 static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 				   enum smu_message_type msg, u32 msg_flags,
 				   bool *skip_pre_poll)
@@ -516,21 +563,36 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		ret = smu_msg_v1_decode_response(reg);
 		if (reg == SMU_RESP_NONE || ret == -EREMOTEIO) {
 			__smu_msg_v1_print_error(ctl, reg, args);
+			__smu_msg_v1_etime_track(ctl, ret);
 			goto out;
 		}
 	}
 
-	/* Send message */
-	__smu_msg_v1_send(ctl, (u16)index, args);
+	/*
+	 * Send message and poll for the response. SMU_RESP_BUSY_OTHER means
+	 * the PMFW is executing another command; its documented client
+	 * behavior is to retry in 10 us, which we do up to
+	 * SMU_MSG_V1_BUSY_RETRIES times before giving up, so a power/clock
+	 * write is not lost while the PMFW makes a transition.
+	 */
+	for (u32 retries = 0;; retries++) {
+		__smu_msg_v1_send(ctl, (u16)index, args);
 
-	/* Post-poll (skip if ASYNC) */
-	if (args->flags & SMU_MSG_FLAG_ASYNC) {
-		ret = 0;
-		goto out;
+		/* Post-poll (skip if ASYNC) */
+		if (args->flags & SMU_MSG_FLAG_ASYNC) {
+			ret = 0;
+			break;
+		}
+
+		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
+		ret = smu_msg_v1_decode_response(reg);
+
+		if (ret == -EBUSY && retries < SMU_MSG_V1_BUSY_RETRIES) {
+			udelay(10);
+			continue;
+		}
+		break;
 	}
-
-	reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
-	ret = smu_msg_v1_decode_response(reg);
 
 	/* FW state update on fatal error */
 	if (ret == -EREMOTEIO) {
@@ -538,6 +600,7 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		__smu_msg_v1_print_error(ctl, reg, args);
 	} else if (ret != 0) {
 		__smu_msg_v1_print_error(ctl, reg, args);
+		__smu_msg_v1_etime_track(ctl, ret);
 	}
 
 	/* Read output args */
@@ -589,6 +652,8 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 
 	if (ret == -EREMOTEIO)
 		smu->smc_fw_state = SMU_FW_HANG;
+	else
+		__smu_msg_v1_etime_track(ctl, ret);
 
 	if (unlikely(adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) &&
 	    ret && (ret != -ETIME)) {

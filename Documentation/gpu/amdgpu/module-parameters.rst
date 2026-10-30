@@ -103,3 +103,12 @@ separately authorized 170 W run into different output directories. Use
 stock voltage and retain startup/periodic compute-oracle checks. Separate
 awake-only load from runtime-PM cycling to distinguish compute corruption
 from a transition failure. Do not combine undervolting and recovery tests.
+
+Offline validation and audit
+----------------------------
+
+Run ``tools/gpu/tests/run-tests.sh`` for the five offline regression suites.
+The capture helper explicitly enables ring overwrite mode so that a full
+buffer retains the most recent records; inspect exported overrun statistics.
+See :doc:`lte-prepush-audit` for corrected pre-push findings and the remaining
+hardware-validation limits.

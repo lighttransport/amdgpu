@@ -99,3 +99,47 @@ Residual limits
 
 The fork branch may be published for experimental review after the corrected
 build/tests pass; that is not approval to install it or run the 170 W test.
+
+
+Previous-boot PCI bus-loss guard, 2026-10-31
+------------------------------------------
+
+The 07:48:55 JST GFX timeout in the previous boot was followed by MES
+queue-command timeouts and unavailable PCI configuration access. The
+journal contains 155 bus-loss reports and 154 failed job recoveries with
+``-ENODEV``. It establishes a recovery storm, not the initial hardware or
+firmware cause; no contemporaneous AER, SMU timeout or VM fault was logged.
+
+The timeout callback now checks physical-device PCI access before dumping
+IP registers and again before full recovery after per-ring reset. A failed
+check parks submission/free workers, restores the removed guilty job under
+the scheduler list lock, cancels queued timeout work and returns
+``DRM_GPU_SCHED_STAT_ENODEV``. The timeout wrapper skips duplicate insertion
+and timer rearm. Parent-fence callbacks remain attached so later completion
+and workqueue restart can release the job. Unlike the older
+``drm_sched_stop()`` path, this does not detach callbacks that the current
+full-reset workqueue restart would not reattach. VF/host FLR behavior
+and present-device recovery paths are unchanged. The guard does not latch
+a permanent unplug state, alter timeout values, or repair the link.
+
+``test-amdgpu-reset-guard.py`` compiles the actual callback, PCI helper and
+scheduler timeout/reinsertion/completion/cleanup functions with mocks and
+fatal UBSan.
+It covers PCI read errors/all-ones responses, early/late loss, completion
+races, job ownership, retained callbacks/later cleanup, healthy-device
+recoveries and VF bypass. The previous
+``1636034a6`` callback fails the first assertion. Kernel concurrency and
+physical recovery remain untested. Each ring is parked on its own timeout;
+this is containment of repeated job recovery, not a device-wide stop of
+all MMIO or a claim that userspace can continue without a reset/rebind.
+
+
+The follow-up full temporary package-source build completed with exit 0
+for ``7.0.0-42-generic``, producing nine modules and retaining amdgpu
+version ``7.1.9.31600000``. The guarded amdgpu_job.c matches the compiled
+copy byte-for-byte, with no compiler warnings in that file. All thirteen
+overlay sources match after expected vendor CONFIG renaming in amdgpu.h
+and amdgpu_drv.c. Existing unrelated warnings remain; BTF was skipped
+without vmlinux. All six driver regression suites pass, including the new
+scheduler/PCI test. No installed sources/modules, live resets, power
+settings or reboot were changed during this follow-up.

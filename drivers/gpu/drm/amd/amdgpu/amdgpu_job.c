@@ -92,6 +92,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 	struct drm_wedge_task_info *info = NULL;
 	struct amdgpu_task_info *ti = NULL;
 	struct amdgpu_device *adev = ring->adev;
+	enum drm_gpu_sched_stat status = DRM_GPU_SCHED_STAT_NO_HANG;
 	int idx, r;
 
 	if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
@@ -101,6 +102,10 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 		/* Effectively the job is aborted as the device is gone */
 		return DRM_GPU_SCHED_STAT_ENODEV;
 	}
+
+	/* Do not dump registers or reset queues on an inaccessible PF. */
+	if (!amdgpu_sriov_vf(adev) && amdgpu_device_bus_status_check(adev))
+		goto device_lost;
 
 	/*
 	 * Do the coredump immediately after a job timeout to get a very
@@ -180,6 +185,11 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 		 */
 		set_bit(AMDGPU_SKIP_COREDUMP, &reset_context.flags);
 
+		/* The device may have disappeared during per-ring recovery. */
+		if (!amdgpu_sriov_vf(adev) &&
+		    amdgpu_device_bus_status_check(adev))
+			goto device_lost;
+
 		r = amdgpu_device_gpu_recover(ring->adev, job, &reset_context);
 		if (r)
 			dev_err(adev->dev, "GPU Recovery Failed: %d\n", r);
@@ -189,11 +199,26 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 			adev->virt.tdr_debug = true;
 	}
 
+	goto exit;
+
+device_lost:
+	/*
+	 * Park submission and free workers before restoring the guilty job
+	 * removed by the timeout worker. Keep its parent callback attached so
+	 * later fence completion can still finish the job. Returning ENODEV
+	 * prevents the wrapper from reinserting it again or rearming recovery.
+	 */
+	drm_sched_wqueue_stop(&ring->sched);
+	spin_lock(&ring->sched.job_list_lock);
+	list_add(&s_job->list, &ring->sched.pending_list);
+	cancel_delayed_work(&ring->sched.work_tdr);
+	spin_unlock(&ring->sched.job_list_lock);
+	status = DRM_GPU_SCHED_STAT_ENODEV;
 exit:
 	amdgpu_vm_put_task_info(ti);
 	drm_dev_exit(idx);
-	/* This is needed to add the job back to the pending list */
-	return DRM_GPU_SCHED_STAT_NO_HANG;
+	/* NO_HANG keeps the existing job reinsertion policy on other paths. */
+	return status;
 }
 
 int amdgpu_job_alloc(struct amdgpu_device *adev, struct amdgpu_vm *vm,

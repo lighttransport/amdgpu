@@ -18,6 +18,13 @@ in temporary directories. UBSan violations are fatal.
   firmware-call counts and callback status; capture tool with fake tracefs,
   decimal buffer bounds, overwrite policy, markers, freeze setup and export.
 
+- `test-amdgpu-reset-guard.py`: PCI config errors/all-ones responses before
+  dumps and after queue reset; real scheduler timeout/completion bookkeeping,
+  pending-job ownership, retained callbacks/later cleanup, racing completion,
+  a later bus drop, healthy-device
+  recovery, and unchanged VF behavior. The old driver fails the first
+  assertion by entering hardware recovery against an inaccessible PF.
+
 These tests do not validate kernel locking, real firmware/power sequencing,
 trace trigger execution on a live kernel, or the stability of a 170 W setting.
 A full build against the target DKMS package/kernel and separately scheduled

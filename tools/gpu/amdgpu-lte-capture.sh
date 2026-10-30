@@ -22,8 +22,9 @@ start)
     mask=$(cat "$param_root/lte_debug")
     (( mask & 7 )) || fail 'lte_debug is disabled (load with lte_debug=7 for all three features)'
     size=${BUFFER_KB:-256}
-    [[ $size =~ ^[0-9]+$ ]] && (( size >= 1 && size <= 16384 )) ||
+    [[ $size =~ ^[0-9]{1,5}$ ]] && (( 10#$size >= 1 && 10#$size <= 16384 )) ||
         fail 'invalid BUFFER_KB (1..16384)'
+    size=$((10#$size))
     freeze=${FREEZE_ON_TIMEOUT:-0}
     [[ $freeze == 0 || $freeze == 1 ]] || fail 'FREEZE_ON_TIMEOUT must be 0 or 1'
     for event in "${events[@]}"; do
@@ -39,6 +40,7 @@ start)
     : > "$instance/set_event"
     echo "$size" > "$instance/buffer_size_kb"
     echo mono > "$instance/trace_clock"
+    echo 1 > "$instance/options/overwrite"
     trigger=$instance/events/amdgpu_lte/amdgpu_lte_smu/trigger
     if grep -q '^traceoff' "$trigger"; then
         echo '!traceoff' > "$trigger"

@@ -26,6 +26,7 @@
 #include <linux/moduleparam.h>
 
 #include "amdgpu.h"
+#include "amdgpu_lte_debug.h"
 #include "amdgpu_smu.h"
 #include "smu_cmn.h"
 #include "soc15_common.h"
@@ -80,6 +81,27 @@ static const char *smu_get_message_name(struct smu_context *smu,
 		return "unknown smu message";
 
 	return __smu_message_names[type];
+}
+
+/* Only cached state is traced: never read MMIO just for diagnostics. */
+static void smu_lte_trace(struct smu_msg_ctl *ctl, const char *phase,
+			  enum smu_message_type msg, u32 param, u32 resp,
+			  int ret, u32 timeout)
+{
+	u32 index = U32_MAX;
+
+	if (!(amdgpu_lte_debug & AMDGPU_LTE_DEBUG_SMU) ||
+	    !trace_amdgpu_lte_smu_enabled())
+		return;
+
+	if (msg < SMU_MSG_MAX_COUNT && ctl->message_map &&
+	    ctl->message_map[msg].valid_mapping)
+		index = ctl->message_map[msg].map_to;
+	trace_amdgpu_lte_smu(ctl->smu->adev, phase,
+			     smu_get_message_name(ctl->smu, msg), index,
+			     param, resp, ret, ctl->smu->smc_fw_state,
+			     ctl->timeout_streak,
+			     timeout ? timeout : ctl->default_timeout);
 }
 
 /* Redefine the SMU error codes here.
@@ -501,7 +523,7 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	struct smu_context *smu = ctl->smu;
 	struct amdgpu_device *adev = smu->adev;
 	const struct cmn2asic_msg_mapping *mapping;
-	u32 reg, msg_flags;
+	u32 reg = SMU_RESP_NONE, msg_flags;
 	int ret, index;
 	bool skip_pre_poll = false;
 	bool lock_held = args->flags & SMU_MSG_FLAG_LOCK_HELD;
@@ -543,6 +565,7 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		dev_err(adev->dev,
 			"SMU is in hanged state, failed to send smu message!\n");
 		ret = -EREMOTEIO;
+		smu_lte_trace(ctl, "blocked", args->msg, 0, 0, ret, args->timeout);
 		goto out;
 	} else if (smu->smc_fw_state == SMU_FW_INIT) {
 		skip_pre_poll = true;
@@ -553,9 +576,11 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 
 	/* Pre-poll: ensure previous message completed */
 	if (!skip_pre_poll) {
+		smu_lte_trace(ctl, "pre-begin", ctl->last_msg, 0, 0, 0, args->timeout);
 		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
 		ret = smu_msg_v1_decode_response(reg);
 		__smu_msg_v1_etime_track(ctl, ret);
+		smu_lte_trace(ctl, "pre-end", ctl->last_msg, 0, reg, ret, args->timeout);
 		if (reg == SMU_RESP_NONE || ret == -EREMOTEIO) {
 			__smu_msg_v1_print_error(ctl, reg, args);
 			goto out;
@@ -570,6 +595,9 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	 * write is not lost while the PMFW makes a transition.
 	 */
 	for (u32 retries = 0;; retries++) {
+		smu_lte_trace(ctl, "send", args->msg,
+			      args->num_args > 0 ? args->args[0] : 0,
+			      0, 0, args->timeout);
 		__smu_msg_v1_send(ctl, (u16)index, args);
 
 		/* Post-poll (skip if ASYNC) */
@@ -580,6 +608,9 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 
 		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
 		ret = smu_msg_v1_decode_response(reg);
+		smu_lte_trace(ctl, "post-end", args->msg,
+			      args->num_args > 0 ? args->args[0] : 0,
+			      reg, ret, args->timeout);
 
 		if (ret == -EBUSY && retries < SMU_MSG_V1_BUSY_RETRIES) {
 			udelay(10);
@@ -645,6 +676,7 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 	if (smu->smc_fw_state == SMU_FW_HANG)
 		return -EREMOTEIO;
 
+	smu_lte_trace(ctl, "wait-begin", ctl->last_msg, 0, 0, 0, timeout_us);
 	reg = __smu_msg_v1_poll_stat(ctl, timeout_us);
 	ret = smu_msg_v1_decode_response(reg);
 
@@ -659,6 +691,8 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 		 (ctl->last_msg != SMU_MSG_DriverMode2Reset &&
 		  ctl->last_msg != SMU_MSG_GfxDeviceDriverReset))
 		__smu_msg_v1_etime_track(ctl, ret);
+
+	smu_lte_trace(ctl, "wait-end", ctl->last_msg, 0, reg, ret, timeout_us);
 
 	if (unlikely(adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) &&
 	    ret && (ret != -ETIME)) {

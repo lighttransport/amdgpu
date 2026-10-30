@@ -29,6 +29,7 @@
 #include <linux/reboot.h>
 
 #include "amdgpu.h"
+#include "amdgpu_lte_debug.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_smu.h"
 #include "smu_internal.h"
@@ -3086,7 +3087,12 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 			return ret;
 	}
 
+	amdgpu_lte_ppt_trace(smu->adev, "request", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, 0);
+
 	if (limit > max_limit || limit < min_limit) {
+		amdgpu_lte_ppt_trace(smu->adev, "range-error", limit_type, limit,
+				     min_limit, max_limit, U32_MAX, -EINVAL);
 		dev_err(smu->adev->dev,
 			"New PPT limit (%d) is out of range [%d,%d]\n",
 			limit, min_limit, max_limit);
@@ -3096,7 +3102,11 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 	if (!smu->ppt_funcs->set_ppt_limit)
 		return -EOPNOTSUPP;
 
+	amdgpu_lte_ppt_trace(smu->adev, "set-begin", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, 0);
 	ret = smu->ppt_funcs->set_ppt_limit(smu, limit_type, limit);
+	amdgpu_lte_ppt_trace(smu->adev, "set-end", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, ret);
 	if (ret)
 		return ret;
 
@@ -3109,9 +3119,13 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 	 * slack allowed for firmware rounding).
 	 */
 	if (smu->ppt_funcs->get_ppt_limit) {
-		u32 held;
+		u32 held = U32_MAX;
 
+		amdgpu_lte_ppt_trace(smu->adev, "readback-begin", limit_type, limit,
+				     min_limit, max_limit, U32_MAX, 0);
 		ret = smu_get_asic_ppt_limit(smu, limit_type, &held);
+		amdgpu_lte_ppt_trace(smu->adev, "readback-end", limit_type, limit,
+				     min_limit, max_limit, ret ? U32_MAX : held, ret);
 		if (ret) {
 			/* Asics that cannot read a limit back (e.g. a PPT1
 			 * implementation returning -EOPNOTSUPP) keep the old
@@ -3124,6 +3138,8 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 				return -EIO;
 			}
 		} else if (abs((int)held - (int)limit) > (int)(limit / 25) + 1) {
+			amdgpu_lte_ppt_trace(smu->adev, "mismatch", limit_type, limit,
+					     min_limit, max_limit, held, -EIO);
 			dev_err(smu->adev->dev,
 				"PPT limit read-back mismatch: set %u, firmware holds %u; refusing the write\n",
 				limit, held);

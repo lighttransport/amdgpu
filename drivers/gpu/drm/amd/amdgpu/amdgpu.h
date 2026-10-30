@@ -228,6 +228,10 @@ extern bool pcie_p2p;
 extern int amdgpu_mtype_local;
 extern int amdgpu_enforce_isolation;
 extern uint amdgpu_debug_mask;
+extern uint amdgpu_lte_debug;
+#define AMDGPU_LTE_DEBUG_SMU BIT(0)
+#define AMDGPU_LTE_DEBUG_PM BIT(1)
+#define AMDGPU_LTE_DEBUG_PPT BIT(2)
 #ifdef CONFIG_HSA_AMD
 extern int sched_policy;
 extern bool debug_evictions;

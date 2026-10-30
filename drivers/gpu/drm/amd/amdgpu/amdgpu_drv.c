@@ -41,6 +41,7 @@
 #include <linux/vga_switcheroo.h>
 
 #include "amdgpu.h"
+#include "amdgpu_lte_debug.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_drv.h"
@@ -244,6 +245,7 @@ int amdgpu_user_partt_mode = AMDGPU_AUTO_COMPUTE_PARTITION_MODE;
 int amdgpu_umsch_mm;
 int amdgpu_seamless = -1; /* auto */
 uint amdgpu_debug_mask;
+uint amdgpu_lte_debug;
 int amdgpu_agp = -1; /* auto */
 int amdgpu_wbrf = -1;
 int amdgpu_damage_clips = -1; /* auto */
@@ -1086,6 +1088,15 @@ module_param_named(seamless, amdgpu_seamless, int, 0444);
  */
 MODULE_PARM_DESC(debug_mask, "debug options for amdgpu, disabled by default");
 module_param_named_unsafe(debug_mask, amdgpu_debug_mask, uint, 0444);
+
+/**
+ * DOC: lte_debug (uint)
+ * LTE diagnostic trace mask: 1 = SMU protocol, 2 = PM/IP phases, 4 = PPT
+ * writes/read-back. Default 0. Also enable the amdgpu_lte tracefs events.
+ * No extra firmware queries or recovery actions are performed.
+ */
+MODULE_PARM_DESC(lte_debug, "LTE diagnostic trace mask (1=SMU, 2=PM, 4=PPT; default 0)");
+module_param_named(lte_debug, amdgpu_lte_debug, uint, 0444);
 
 /**
  * DOC: agp (int)
@@ -2972,10 +2983,14 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
 		adev->mp1_state = PP_MP1_STATE_UNLOAD;
 
+	amdgpu_lte_pm_trace(adev, "runtime", "prepare-begin", 0, false);
 	ret = amdgpu_device_prepare(drm_dev);
+	amdgpu_lte_pm_trace(adev, "runtime", "prepare-end", ret, false);
 	if (ret)
 		goto out;
+	amdgpu_lte_pm_trace(adev, "runtime", "suspend-begin", 0, false);
 	ret = amdgpu_device_suspend(drm_dev, false);
+	amdgpu_lte_pm_trace(adev, "runtime", "suspend-end", ret, false);
 	if (ret)
 		goto out;
 
@@ -2995,7 +3010,9 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 		/* nothing to do */
 	} else if ((adev->pm.rpm_mode == AMDGPU_RUNPM_BACO) ||
 			(adev->pm.rpm_mode == AMDGPU_RUNPM_BAMACO)) {
-		amdgpu_device_baco_enter(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-enter-begin", 0, false);
+		ret = amdgpu_device_baco_enter(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-enter-end", ret, false);
 	}
 
 	dev_dbg(&pdev->dev, "asic/device is runtime suspended\n");
@@ -3055,14 +3072,18 @@ static int amdgpu_pmops_runtime_resume(struct device *dev)
 		pci_set_master(pdev);
 	} else if ((adev->pm.rpm_mode == AMDGPU_RUNPM_BACO) ||
 			(adev->pm.rpm_mode == AMDGPU_RUNPM_BAMACO)) {
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-exit-begin", 0, false);
 		ret = amdgpu_device_baco_exit(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-exit-end", ret, false);
 		if (ret) {
 			dev_err(dev, "Failed to exit BACO during runtime resume: %d\n",
 				ret);
 			return ret;
 		}
 	}
+	amdgpu_lte_pm_trace(adev, "runtime", "resume-begin", 0, false);
 	ret = amdgpu_device_resume(drm_dev, false);
+	amdgpu_lte_pm_trace(adev, "runtime", "resume-end", ret, false);
 	if (ret) {
 		if (adev->pm.rpm_mode == AMDGPU_RUNPM_PX)
 			pci_disable_device(pdev);

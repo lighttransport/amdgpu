@@ -23,6 +23,7 @@
 
 #include "amdgpu.h"
 #include "amdgpu_ip.h"
+#include "amdgpu_lte_debug.h"
 
 static int8_t amdgpu_logical_to_dev_inst(struct amdgpu_device *adev,
 					 enum amd_hw_ip_block_type block,
@@ -99,9 +100,15 @@ int amdgpu_ip_block_suspend(struct amdgpu_ip_block *ip_block)
 {
 	int r;
 
+	amdgpu_lte_pm_trace(ip_block->adev, ip_block->version->funcs->name,
+			    "suspend-begin", 0, ip_block->status.hw);
+
 	if (ip_block->version->funcs->suspend) {
 		r = ip_block->version->funcs->suspend(ip_block);
 		if (r) {
+			amdgpu_lte_pm_trace(ip_block->adev,
+					    ip_block->version->funcs->name,
+					    "suspend-end", r, ip_block->status.hw);
 			dev_err(ip_block->adev->dev,
 				"suspend of IP block <%s> failed %d\n",
 				ip_block->version->funcs->name, r);
@@ -110,6 +117,8 @@ int amdgpu_ip_block_suspend(struct amdgpu_ip_block *ip_block)
 	}
 
 	ip_block->status.hw = false;
+	amdgpu_lte_pm_trace(ip_block->adev, ip_block->version->funcs->name,
+			    "suspend-end", 0, ip_block->status.hw);
 	return 0;
 }
 
@@ -117,9 +126,15 @@ int amdgpu_ip_block_resume(struct amdgpu_ip_block *ip_block)
 {
 	int r;
 
+	amdgpu_lte_pm_trace(ip_block->adev, ip_block->version->funcs->name,
+			    "resume-begin", 0, ip_block->status.hw);
+
 	if (ip_block->version->funcs->resume) {
 		r = ip_block->version->funcs->resume(ip_block);
 		if (r) {
+			amdgpu_lte_pm_trace(ip_block->adev,
+					    ip_block->version->funcs->name,
+					    "resume-end", r, ip_block->status.hw);
 			dev_err(ip_block->adev->dev,
 				"resume of IP block <%s> failed %d\n",
 				ip_block->version->funcs->name, r);
@@ -128,6 +143,8 @@ int amdgpu_ip_block_resume(struct amdgpu_ip_block *ip_block)
 	}
 
 	ip_block->status.hw = true;
+	amdgpu_lte_pm_trace(ip_block->adev, ip_block->version->funcs->name,
+			    "resume-end", 0, ip_block->status.hw);
 	return 0;
 }
 

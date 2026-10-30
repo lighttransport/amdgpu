@@ -3052,7 +3052,12 @@ static int amdgpu_pmops_runtime_resume(struct device *dev)
 		pci_set_master(pdev);
 	} else if ((adev->pm.rpm_mode == AMDGPU_RUNPM_BACO) ||
 			(adev->pm.rpm_mode == AMDGPU_RUNPM_BAMACO)) {
-		amdgpu_device_baco_exit(adev);
+		ret = amdgpu_device_baco_exit(adev);
+		if (ret) {
+			dev_err(dev, "Failed to exit BACO during runtime resume: %d\n",
+				ret);
+			return ret;
+		}
 	}
 	ret = amdgpu_device_resume(drm_dev, false);
 	if (ret) {

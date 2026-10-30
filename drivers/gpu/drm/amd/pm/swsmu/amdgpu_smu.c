@@ -2135,6 +2135,10 @@ static int smu_disable_dpms(struct smu_context *smu)
 		}
 	}
 
+	/* Do not halt RLC while the SMU may still be managing its features. */
+	if (ret)
+		return ret;
+
 	/* Notify SMU RLC is going to be off, stop RLC and SMU interaction.
 	 * otherwise SMU will hang while interacting with RLC if RLC is halted
 	 * this is a WA for Vangogh asic which fix the SMU hang issue.

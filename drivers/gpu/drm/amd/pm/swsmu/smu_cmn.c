@@ -650,7 +650,14 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 
 	if (ret == -EREMOTEIO)
 		smu->smc_fw_state = SMU_FW_HANG;
-	else
+	/*
+	 * Reset callers own a longer, bounded ACK wait. Timing out one poll
+	 * must not prevent a later poll from observing reset completion.
+	 * A subsequent send still applies the normal pre-poll policy.
+	 */
+	else if (ret != -ETIME ||
+		 (ctl->last_msg != SMU_MSG_DriverMode2Reset &&
+		  ctl->last_msg != SMU_MSG_GfxDeviceDriverReset))
 		__smu_msg_v1_etime_track(ctl, ret);
 
 	if (unlikely(adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) &&

@@ -603,7 +603,7 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		/* Post-poll (skip if ASYNC) */
 		if (args->flags & SMU_MSG_FLAG_ASYNC) {
 			ret = 0;
-			break;
+			goto out;
 		}
 
 		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);

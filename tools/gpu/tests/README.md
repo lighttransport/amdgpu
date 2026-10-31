@@ -28,8 +28,12 @@ in temporary directories. UBSan violations are fatal.
   ordering; a two-job case checks list order, callbacks and cleanup.
   Completed jobs bypass recovery before or during the first PCI probe.
   Domain-reader/writer mocks check busy reset deferral, reset resume after
-  parking, balanced readers, and unlocked coredump/full-reset entry. The old driver fails the first
-  assertion by entering hardware recovery against an inaccessible PF.
+  parking, balanced readers, and unlocked coredump/full-reset entry.
+  The final audit also extracts scheduler fini/cancellation to check cleanup
+  of parked jobs with completed, failed, unfinished and absent parents,
+  multiple pending jobs and an empty scheduler. A reset may immediately
+  finish/free the job at reader unlock without a later timeout dereference.
+  Disabling the cancellation callback fails the teardown cleanup assertion.
 
 These tests do not validate kernel locking, real firmware/power sequencing,
 trace trigger execution on a live kernel, or the stability of a 170 W setting.

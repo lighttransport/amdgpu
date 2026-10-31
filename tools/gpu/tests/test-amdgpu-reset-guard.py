@@ -50,15 +50,23 @@ static void list_del_init(struct list_head *n) {
  n->prev->next=n->next; n->next->prev=n->prev; INIT_LIST_HEAD(n);
 }
 #define list_first_entry_or_null(h,t,m) (list_empty(h) ? NULL : container_of((h)->next,t,m))
+#define list_del(n) list_del_init(n)
+#define list_for_each_entry_safe_reverse(pos,tmp,head,member) \
+ for(pos=container_of((head)->prev,typeof(*pos),member), \
+     tmp=container_of(pos->member.prev,typeof(*pos),member); \
+     &pos->member!=(head); \
+     pos=tmp,tmp=container_of(tmp->member.prev,typeof(*tmp),member))
 enum drm_gpu_sched_stat { DRM_GPU_SCHED_STAT_RESET, DRM_GPU_SCHED_STAT_ENODEV, DRM_GPU_SCHED_STAT_NO_HANG };
 struct work_struct { bool queued, free_worker; };
 struct delayed_work { struct work_struct work; struct { unsigned long expires; } timer; bool pending; };
-struct dma_fence { int status, error; bool callback; unsigned long flags, timestamp; };
+struct drm_sched_job;
+struct dma_fence { int status, error; bool callback; unsigned long flags, timestamp; int *lock; struct drm_sched_job *owner; };
 struct drm_sched_fence { struct dma_fence finished, scheduled, *parent; struct drm_gpu_scheduler *sched; };
 struct drm_sched_job;
 struct drm_sched_backend_ops {
  enum drm_gpu_sched_stat (*timedout_job)(struct drm_sched_job *);
  void (*free_job)(struct drm_sched_job *);
+ void (*cancel_job)(struct drm_sched_job *);
 };
 struct drm_gpu_scheduler {
  const char *name; int job_list_lock, credit_count, score_value, *score;
@@ -66,6 +74,7 @@ struct drm_gpu_scheduler {
  const struct drm_sched_backend_ops *ops; bool free_guilty, pause_submit;
  unsigned long timeout; void *timeout_wq, *submit_wq;
  struct work_struct work_run_job, work_free_job;
+ bool ready, own_submit_wq; int job_scheduled; void *dev;
 };
 struct drm_sched_job {
  struct drm_gpu_scheduler *sched; struct drm_sched_fence *s_fence;
@@ -115,6 +124,7 @@ static int ring_ret, ip_ret, recover_ret;
 static unsigned dumps, ring_resets, ip_resets, recovers, enters, exits;
 static unsigned task_gets, task_puts, stops, starts, arms, cancels, frees, free_queues;
 static unsigned read_attempts, read_locks, read_unlocks, reset_completions;
+static unsigned teardown_warnings;
 static bool reset_pending, reset_during_ring;
 static struct amdgpu_reset_domain reset_domain;
 static struct amdgpu_task_info task;
@@ -131,6 +141,8 @@ void up_read(struct rw_semaphore *s) {
 }
 static void spin_lock(int *l) { assert(!*l); *l=1; }
 static void spin_unlock(int *l) { assert(*l); *l=0; }
+#define spin_lock_irqsave(l,f) do { (f)=0; spin_lock(l); } while(0)
+#define spin_unlock_irqrestore(l,f) do { (void)(f); spin_unlock(l); } while(0)
 #define lockdep_assert_held(l) assert(*(l))
 #define atomic_read(p) (*(p))
 #define atomic_inc(p) (++*(p))
@@ -142,6 +154,10 @@ static void spin_unlock(int *l) { assert(*l); *l=0; }
 #define set_bit(b,p) (*(p)|=(1UL<<(b)))
 #define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define dev_warn(...) (teardown_warnings++)
+#define EXPORT_SYMBOL(f)
+static void wake_up_all(int *w) { (void)w; }
+static void destroy_workqueue(void *q) { (void)q; }
 #define trace_drm_sched_job_done(f) ((void)(f))
 #define DMA_FENCE_FLAG_TIMESTAMP_BIT 0
 #define test_bit(b,p) ((*(p)&(1UL<<(b)))!=0)
@@ -187,11 +203,18 @@ static int amdgpu_device_gpu_recover(struct amdgpu_device *a,struct amdgpu_job *
 static void dma_fence_put(struct dma_fence *f) { assert(f); }
 static void dma_fence_get(struct dma_fence *f) { assert(f); }
 static bool dma_fence_is_signaled(struct dma_fence *f) { return f->status!=0; }
+static void drm_sched_job_done(struct drm_sched_job *, int);
+static bool dma_fence_is_signaled_locked(struct dma_fence *f) { assert(*f->lock);return dma_fence_is_signaled(f); }
+static void dma_fence_signal_locked(struct dma_fence *f) {
+ assert(*f->lock && !f->status);f->status=f->error ? f->error : 1;
+ if(f->callback) { f->callback=false;assert(f->owner);drm_sched_job_done(f->owner,f->error); }
+}
 static void drm_sched_fence_finished(struct drm_sched_fence *f,int result) { if(result) dma_fence_set_error(&f->finished,result);f->finished.status=result ? result : 1; }
 static bool mod_delayed_work(void *q,struct delayed_work *w,unsigned long delay) { (void)q;bool was_pending=w->pending;w->pending=true;arms++;w->timer.expires=jiffies+delay;return was_pending; }
 static void cancel_delayed_work(struct delayed_work *w) { w->pending=false;cancels++; }
+static void cancel_delayed_work_sync(struct delayed_work *w) { cancel_delayed_work(w); }
 #define time_after(a,b) ((long)((b)-(a))<0)
-static void free_job(struct drm_sched_job *j) { assert(list_empty(&j->list));assert(!j->freed);j->freed=true;frees++; }
+static void free_job(struct drm_sched_job *j) { assert(list_empty(&j->list));assert(!j->freed);j->freed=true;j->sched=NULL;j->s_fence=NULL;frees++; }
 static unsigned long drm_sched_suspend_timeout(struct drm_gpu_scheduler *);
 '''
 
@@ -203,6 +226,7 @@ code += function(scheduler, 'drm_sched_wqueue_start')
 code += function(scheduler, 'drm_sched_run_free_queue')
 code += function(driver + 'amdgpu.h', 'amdgpu_device_bus_status_check')
 code += function(driver + 'amdgpu_job.c', 'amdgpu_job_timedout')
+code += function(driver + 'amdgpu_job.c', 'amdgpu_job_cancel')
 code += function(scheduler, 'drm_sched_start_timeout')
 code += function(scheduler, 'drm_sched_start_timeout_unlocked')
 code += function(scheduler, 'drm_sched_suspend_timeout')
@@ -210,6 +234,9 @@ code += function(scheduler, 'drm_sched_job_reinsert_on_false_timeout')
 code += function(scheduler, 'drm_sched_job_timedout')
 code += function(scheduler, 'drm_sched_job_done')
 code += function(scheduler, 'drm_sched_get_finished_job')
+code += function(scheduler, 'drm_sched_cancel_remaining_jobs')
+code += function(scheduler, 'drm_sched_fini')
+assert '.cancel_job = amdgpu_job_cancel' in (root / driver / 'amdgpu_job.c').read_text()
 
 code += r'''
 static struct amdgpu_device adev;
@@ -217,7 +244,8 @@ static struct amdgpu_ring ring;
 static struct amdgpu_job job;
 static struct drm_sched_fence sf;
 static struct dma_fence hw;
-static const struct drm_sched_backend_ops ops={amdgpu_job_timedout,free_job};
+static const struct drm_sched_backend_ops ops={amdgpu_job_timedout,free_job,amdgpu_job_cancel};
+static int fence_lock;
 static int reset_marker(void) { return 0; }
 static void setup(void) {
  memset(&adev,0,sizeof(adev));memset(&ring,0,sizeof(ring));
@@ -231,6 +259,8 @@ static void setup(void) {
  INIT_LIST_HEAD(&ring.sched.pending_list);INIT_LIST_HEAD(&job.base.list);
  job.base.sched=&ring.sched;job.base.s_fence=&sf;job.base.credits=1;
  job.hw_fence=&hw;sf.parent=&hw;hw.callback=true;
+ fence_lock=0;hw.lock=&fence_lock;hw.owner=&job.base;
+ teardown_warnings=0;ring.sched.ready=true;
  list_add(&job.base.list,&ring.sched.pending_list);
  amdgpu_gpu_recovery=recovery_allowed=1;supported=3;
  config_reads=missing_at=config_error=unplugged=soft_ok=0;stop_hook=config_hook=NULL;
@@ -267,7 +297,58 @@ static void request_reset_during_config_read(void) {
  assert(reset_domain.sem.readers==1 && !reset_domain.sem.writer);
  reset_pending=true;reset_resume_hook=resume_after_reset;
 }
+static void finish_parent(struct dma_fence *f,int error) {
+ unsigned long flags;
+ spin_lock_irqsave(f->lock,flags);dma_fence_set_error(f,error);
+ dma_fence_signal_locked(f);spin_unlock_irqrestore(f->lock,flags);
+}
+static void resume_and_free_after_reset(void) {
+ resume_after_reset();finish_parent(&hw,0);
+ struct drm_sched_job *done=drm_sched_get_finished_job(&ring.sched);
+ assert(done==&job.base);free_job(done);
+}
+static void request_reset_and_free(void) {
+ request_reset_during_config_read();reset_resume_hook=resume_and_free_after_reset;
+}
 int main(void) {
+ /* Parked jobs must be freed on teardown without resuming submission. */
+ for(int completed=0;completed<3;completed++) {
+  setup();missing_at=1;timeout();
+  if(completed) finish_parent(&hw,completed==1 ? 0 : -EIO);
+  assert(!ring.sched.work_free_job.queued && !frees);
+  drm_sched_fini(&ring.sched);
+  assert(frees==1 && list_empty(&ring.sched.pending_list) && !teardown_warnings);
+  assert(!ring.sched.ready && ring.sched.pause_submit && !starts && !hw.callback);
+  assert(ring.sched.credit_count==0 && ring.sched.score_value==0);
+  assert(sf.finished.status==(completed==1 ? 1 : completed==2 ? -EIO : -ECANCELED));
+ }
+ /* Failed submission: the scheduler already finished it without a parent. */
+ setup();sf.parent=NULL;hw.callback=false;drm_sched_job_done(&job.base,-EIO);
+ drm_sched_fini(&ring.sched);
+ assert(frees==1 && !teardown_warnings && sf.finished.status==-EIO);
+
+ /* Teardown handles a mixed pending list and an already-empty scheduler. */
+ setup();missing_at=1;
+ struct amdgpu_job tail={0};struct drm_sched_fence tail_sf={0};struct dma_fence tail_hw={0};
+ tail.base.sched=&ring.sched;tail.base.s_fence=&tail_sf;tail.base.credits=1;
+ tail_sf.sched=&ring.sched;tail_sf.parent=&tail_hw;
+ tail_hw.callback=true;tail_hw.owner=&tail.base;tail_hw.lock=&fence_lock;
+ INIT_LIST_HEAD(&tail.base.list);list_add(&tail.base.list,&job.base.list);
+ ring.sched.credit_count++;ring.sched.score_value++;timeout();finish_parent(&tail_hw,0);
+ drm_sched_fini(&ring.sched);
+ assert(frees==2 && !teardown_warnings && list_empty(&ring.sched.pending_list));
+ assert(sf.finished.status==-ECANCELED && tail_sf.finished.status==1);
+ assert(ring.sched.credit_count==0 && ring.sched.score_value==0 && !hw.callback && !tail_hw.callback);
+ setup();finish_parent(&hw,0);
+ struct drm_sched_job *empty_done=drm_sched_get_finished_job(&ring.sched);
+ assert(empty_done==&job.base);free_job(empty_done);drm_sched_fini(&ring.sched);
+ assert(frees==1 && !teardown_warnings && list_empty(&ring.sched.pending_list));
+
+ /* AER may resume, complete and free the job as soon as the reader unlocks. */
+ setup();missing_at=1;config_hook=request_reset_and_free;timeout();
+ assert(frees==1 && !ring.sched.pause_submit && list_empty(&ring.sched.pending_list));
+ assert(job.base.s_fence==NULL && job.base.sched==NULL && !ring.sched.work_tdr.pending);
+
  /* A vanished PF: no dump, MMIO recovery or rearm; job remains owned. */
  setup();missing_at=1;timeout();
  assert(config_reads==1 && !dumps && !ring_resets && !recovers);
@@ -389,7 +470,7 @@ int main(void) {
  /* Already unplugged remains the original early-exit path. */
  setup();unplugged=1;timeout();
  assert(!config_reads && !dumps && !stops && !arms && !exits);
- puts("PASS: completed-job bypass, reset-domain busy/serialization/unlock, PCI loss, workqueue/timer races, pending-job ownership, healthy recovery and VF bypass");
+ puts("PASS: parked-job teardown/cancellation, unlock-time free, completed-job bypass, reset-domain serialization, PCI loss, scheduler ownership, healthy recovery and VF bypass");
  return 0;
 }
 '''

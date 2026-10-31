@@ -226,3 +226,36 @@ module target directly. Nine module artifacts remain, thirteen overlay
 sources match after vendor CONFIG normalization, and amdgpu_job.c emits no
 warnings. Checkpatch and whitespace checks pass. No driver installation,
 push, live reset, power write or reboot was performed.
+
+Final guard review: parked-job teardown
+--------------------------------------
+
+Review of tip ``487b5e82a`` found another ownership gap. Bus-loss parking
+stops both submission and free workers. Hardware fence completion alone
+therefore cannot free those pending jobs. AMDGPU did not implement the
+scheduler cancel_job callback, so drm_sched_fini could leave the pending
+list populated and leak the jobs if no reset had restarted the scheduler.
+
+Add amdgpu_job_cancel to the backend operations. Scheduler teardown drains
+submission and timeout work before calling it. It locks the parent fence,
+signals it with -ECANCELED only if still unsignaled, and leaves completed
+results intact. The existing parent callback completes scheduler accounting;
+drm_sched_fini removes and frees the job. Failed submissions have no parent
+and are already finished. The callback performs no MMIO or queue restart.
+
+The regression now extracts drm_sched_fini and its cancellation loop too.
+It covers parked completed/error/unfinished jobs, null-parent failed
+submissions, mixed pending jobs, empty teardown, and completion/free at the
+reset-reader unlock boundary. Freed mock jobs lose their scheduler/fence
+pointers to detect subsequent use. Disabling cancel_job reproduces the
+nonempty-list/zero-frees assertion failure. Six suites pass with fatal
+UBSan; the reset suite also passes Clang ASan+UBSan with leak detection
+disabled because this sandbox prevents LeakSanitizer thread inspection.
+Explicit list/accounting assertions establish the modeled cleanup outcome.
+
+The changed module was compiled and relinked against 7.0.0-42-generic in
+the existing packaged scratch build. This is software validation: it does
+not prove physical PCI/PM recovery, that removal reaches software teardown,
+or that hardware fence draining cannot hang earlier. Existing partial
+suspend unwind, ignored BACO-entry errors and concurrent fault-filter
+limitations remain. No live reset, installation, power change or push.

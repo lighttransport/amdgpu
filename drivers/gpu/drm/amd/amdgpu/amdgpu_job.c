@@ -360,6 +360,27 @@ void amdgpu_job_free_resources(struct amdgpu_job *job)
 		amdgpu_ib_free(&job->ibs[i], f);
 }
 
+static void amdgpu_job_cancel(struct drm_sched_job *s_job)
+{
+	struct dma_fence *fence = s_job->s_fence->parent;
+	unsigned long flags;
+
+	/* A failed submission has no parent and is already finished. */
+	if (!fence)
+		return;
+
+	/*
+	 * Teardown has stopped submission and timeout work. Signal through the
+	 * parent callback before the scheduler frees even a parked job.
+	 */
+	spin_lock_irqsave(fence->lock, flags);
+	if (!dma_fence_is_signaled_locked(fence)) {
+		dma_fence_set_error(fence, -ECANCELED);
+		dma_fence_signal_locked(fence);
+	}
+	spin_unlock_irqrestore(fence->lock, flags);
+}
+
 static void amdgpu_job_free_cb(struct drm_sched_job *s_job)
 {
 	struct amdgpu_job *job = to_amdgpu_job(s_job);
@@ -573,5 +594,6 @@ const struct drm_sched_backend_ops amdgpu_sched_ops = {
 	.prepare_job = amdgpu_job_prepare_job,
 	.run_job = amdgpu_job_run,
 	.timedout_job = amdgpu_job_timedout,
-	.free_job = amdgpu_job_free_cb
+	.free_job = amdgpu_job_free_cb,
+	.cancel_job = amdgpu_job_cancel
 };

@@ -73,10 +73,13 @@ struct drm_sched_job {
 };
 struct device { int unused; };
 struct pci_dev { int unused; };
+struct rw_semaphore { unsigned readers; bool writer; };
+struct amdgpu_reset_domain { struct rw_semaphore sem; };
 struct drm_wedge_task_info { int unused; };
 struct amdgpu_task_info { struct drm_wedge_task_info task; };
 struct amdgpu_device {
  struct device *dev; struct pci_dev *pdev; bool vf;
+ struct amdgpu_reset_domain *reset_domain;
  struct { bool tdr_debug; } virt; int gpu_reset_counter;
 };
 struct amdgpu_ring {
@@ -111,8 +114,21 @@ static int config_reads, missing_at, config_error, unplugged, soft_ok;
 static int ring_ret, ip_ret, recover_ret;
 static unsigned dumps, ring_resets, ip_resets, recovers, enters, exits;
 static unsigned task_gets, task_puts, stops, starts, arms, cancels, frees, free_queues;
+static unsigned read_attempts, read_locks, read_unlocks, reset_completions;
+static bool reset_pending, reset_during_ring;
+static struct amdgpu_reset_domain reset_domain;
 static struct amdgpu_task_info task;
-static void (*stop_hook)(void);
+static void (*stop_hook)(void), (*config_hook)(void), (*reset_resume_hook)(void);
+int down_read_trylock(struct rw_semaphore *s) {
+ read_attempts++;if(s->writer) return false;s->readers++;read_locks++;return true;
+}
+void up_read(struct rw_semaphore *s) {
+ assert(s->readers==1 && !s->writer);s->readers--;read_unlocks++;
+ if(reset_pending) {
+  reset_pending=false;s->writer=true;reset_completions++;
+  assert(reset_resume_hook);reset_resume_hook();s->writer=false;
+ }
+}
 static void spin_lock(int *l) { assert(!*l); *l=1; }
 static void spin_unlock(int *l) { assert(*l); *l=0; }
 #define lockdep_assert_held(l) assert(*(l))
@@ -132,6 +148,8 @@ static void spin_unlock(int *l) { assert(*l); *l=0; }
 static unsigned long dma_fence_timestamp(struct dma_fence *f) { return f->timestamp; }
 static int pci_read_config_dword(struct pci_dev *p, int reg, u32 *status) {
  (void)p; assert(reg==PCI_COMMAND); config_reads++;
+ assert(reset_domain.sem.readers==1 && !reset_domain.sem.writer);
+ if(config_hook) { void (*hook)(void)=config_hook;config_hook=NULL;hook(); }
  *status=missing_at && config_reads>=missing_at ? UINT32_MAX : 7;
  return config_error;
 }
@@ -139,7 +157,7 @@ static bool drm_dev_enter(struct amdgpu_device *a,int *idx) {
  (void)a; enters++; *idx=9; return !unplugged;
 }
 static void drm_dev_exit(int idx) { assert(idx==9); exits++; }
-static void amdgpu_job_core_dump(struct amdgpu_device *a,struct amdgpu_job *j) { (void)a;(void)j;dumps++; }
+static void amdgpu_job_core_dump(struct amdgpu_device *a,struct amdgpu_job *j) { (void)a;(void)j;assert(!reset_domain.sem.readers);dumps++; }
 static bool amdgpu_ring_is_reset_type_supported(struct amdgpu_ring *r,int t) { (void)r;return supported&t; }
 static bool amdgpu_ring_soft_recovery(struct amdgpu_ring *r,int v,struct dma_fence *f) { (void)r;(void)v;(void)f;return soft_ok; }
 static struct amdgpu_task_info *amdgpu_vm_get_task_info_pasid(struct amdgpu_device *a,int p) { (void)a;(void)p;task_gets++;return &task; }
@@ -157,14 +175,14 @@ static bool queue_work(void *q,struct work_struct *w) {
  if(w->free_worker) free_queues++;else starts++;
  return !was_queued;
 }
-static int amdgpu_ring_reset(struct amdgpu_ring *r,int v,struct dma_fence *f) { (void)r;(void)v;(void)f;ring_resets++;return ring_ret; }
+static int amdgpu_ring_reset(struct amdgpu_ring *r,int v,struct dma_fence *f) { (void)r;(void)v;(void)f;assert(!reset_domain.sem.readers);if(reset_during_ring) reset_domain.sem.writer=true;ring_resets++;return ring_ret; }
 static int amdgpu_device_ip_soft_reset(struct amdgpu_ring *r,struct dma_fence *f) { (void)r;(void)f;ip_resets++;return ip_ret; }
 static void drm_dev_wedged_event(struct amdgpu_device *a,int reason,struct drm_wedge_task_info *t) { (void)a;(void)reason;(void)t; }
 static int dma_fence_get_status(struct dma_fence *f) { return f->status; }
 static void dma_fence_set_error(struct dma_fence *f,int e) { assert(!f->status);f->error=e; }
 static bool amdgpu_device_should_recover_gpu(struct amdgpu_device *a) { (void)a;return recovery_allowed; }
 static int amdgpu_device_gpu_recover(struct amdgpu_device *a,struct amdgpu_job *j,struct amdgpu_reset_context *c) {
- assert(c->reset_req_dev==a && c->src==AMDGPU_RESET_SRC_JOB); (void)j;recovers++;return recover_ret;
+ assert(c->reset_req_dev==a && c->src==AMDGPU_RESET_SRC_JOB);assert(!reset_domain.sem.readers && !reset_domain.sem.writer);(void)j;recovers++;return recover_ret;
 }
 static void dma_fence_put(struct dma_fence *f) { assert(f); }
 static void dma_fence_get(struct dma_fence *f) { assert(f); }
@@ -203,6 +221,7 @@ static const struct drm_sched_backend_ops ops={amdgpu_job_timedout,free_job};
 static int reset_marker(void) { return 0; }
 static void setup(void) {
  memset(&adev,0,sizeof(adev));memset(&ring,0,sizeof(ring));
+ memset(&reset_domain,0,sizeof(reset_domain));adev.reset_domain=&reset_domain;
  memset(&job,0,sizeof(job));memset(&sf,0,sizeof(sf));memset(&hw,0,sizeof(hw));
  static typeof(*ring.funcs) funcs={reset_marker};ring.funcs=&funcs;
  ring.adev=&adev;ring.sched.name="gfx_0.0.0";ring.sched.ops=&ops;
@@ -214,12 +233,17 @@ static void setup(void) {
  job.hw_fence=&hw;sf.parent=&hw;hw.callback=true;
  list_add(&job.base.list,&ring.sched.pending_list);
  amdgpu_gpu_recovery=recovery_allowed=1;supported=3;
- config_reads=missing_at=config_error=unplugged=soft_ok=0;stop_hook=NULL;
+ config_reads=missing_at=config_error=unplugged=soft_ok=0;stop_hook=config_hook=NULL;
+ read_attempts=read_locks=read_unlocks=reset_completions=0;
+ reset_pending=reset_during_ring=false;reset_resume_hook=NULL;
  ring_ret=ip_ret=-EIO;recover_ret=0;
  dumps=ring_resets=ip_resets=recovers=enters=exits=0;
  task_gets=task_puts=stops=starts=arms=cancels=frees=free_queues=0;
 }
-static void timeout(void) { ring.sched.work_tdr.pending=false;drm_sched_job_timedout(&ring.sched.work_tdr.work); }
+static void timeout(void) {
+ ring.sched.work_tdr.pending=false;drm_sched_job_timedout(&ring.sched.work_tdr.work);
+ assert(!reset_domain.sem.readers && read_locks==read_unlocks);
+}
 static void pending_once(void) {
  assert(ring.sched.pending_list.next==&job.base.list);
  assert(ring.sched.pending_list.prev==&job.base.list);
@@ -233,6 +257,15 @@ static void finish_while_stopping(void) {
  if(done) free_job(done);
  /* A timer queued by in-flight work must also be canceled by the guard. */
  mod_delayed_work(ring.sched.timeout_wq,&ring.sched.work_tdr,13);
+}
+static void finish_during_config_read(void) { drm_sched_job_done(&job.base,0); }
+static void resume_after_reset(void) {
+ assert(reset_domain.sem.writer && !reset_domain.sem.readers);
+ drm_sched_wqueue_start(&ring.sched);
+}
+static void request_reset_during_config_read(void) {
+ assert(reset_domain.sem.readers==1 && !reset_domain.sem.writer);
+ reset_pending=true;reset_resume_hook=resume_after_reset;
 }
 int main(void) {
  /* A vanished PF: no dump, MMIO recovery or rearm; job remains owned. */
@@ -251,6 +284,22 @@ int main(void) {
  struct drm_sched_job *done=drm_sched_get_finished_job(&ring.sched);
  assert(done==&job.base);free_job(done);
  assert(frees==1 && list_empty(&ring.sched.pending_list));
+
+ /* A reset that owns the domain must not be waited on or followed by a park. */
+ setup();missing_at=1;reset_domain.sem.writer=true;timeout();
+ assert(read_attempts==1 && !read_locks && !config_reads && !stops);
+ assert(!dumps && !ring_resets && !recovers && !ring.sched.pause_submit);pending_once();
+
+ /* A writer arriving after the failed probe must resume only after parking. */
+ setup();missing_at=1;config_hook=request_reset_during_config_read;timeout();
+ assert(read_locks==1 && read_unlocks==1 && reset_completions==1 && !reset_pending);
+ assert(stops==1 && starts==1 && !ring.sched.pause_submit);
+ assert(!dumps && !ring_resets && !recovers && sf.parent==&hw);pending_once();
+
+ /* Drop the read lock before a normal reset, and defer if AER starts later. */
+ setup();reset_during_ring=true;timeout();
+ assert(config_reads==1 && ring_resets==1 && !recovers && read_attempts==2);
+ assert(read_locks==1 && read_unlocks==1 && stops==1 && task_gets==task_puts);pending_once();
 
  /* Wait for active work before reinserting; do not lose a newly queued timer. */
  setup();missing_at=1;stop_hook=finish_while_stopping;timeout();
@@ -280,12 +329,29 @@ int main(void) {
  setup();config_error=-EIO;timeout();
  assert(stops==1 && !dumps && !ring_resets && !arms);pending_once();
 
- /* A completion race also remains pending until the parked free worker resumes. */
+ /* A completed timeout must not probe or park an otherwise usable queue. */
  setup();missing_at=1;hw.callback=false;drm_sched_job_done(&job.base,0);timeout();
- assert(!frees && !arms && !ring.sched.free_guilty && enters==exits);pending_once();
- drm_sched_wqueue_start(&ring.sched);
+ assert(!config_reads && !stops && !ring.sched.pause_submit && !dumps && !ring_resets && !recovers);
+ assert(!frees && !ring.sched.free_guilty && enters==exits);pending_once();
+ assert(ring.sched.work_free_job.queued);
  done=drm_sched_get_finished_job(&ring.sched);assert(done==&job.base);free_job(done);
  assert(frees==1 && list_empty(&ring.sched.pending_list));
+
+ /* Completion while the first config read fails must bypass the park too. */
+ setup();missing_at=1;config_hook=finish_during_config_read;timeout();
+ assert(config_reads==1 && !stops && !ring.sched.pause_submit && !dumps && !ring_resets && !recovers);
+ assert(!frees && ring.sched.work_free_job.queued && enters==exits);pending_once();
+ done=drm_sched_get_finished_job(&ring.sched);assert(done==&job.base);free_job(done);
+ assert(frees==1 && list_empty(&ring.sched.pending_list));
+
+ /* The already-completed fast path also avoids recovery on a present PF/VF. */
+ for(int vf=0;vf<2;vf++) {
+  for(int failed=0;failed<2;failed++) {
+   setup();adev.vf=vf;drm_sched_job_done(&job.base,failed ? -EIO : 0);timeout();
+   assert(!config_reads && !stops && !dumps && !ring_resets && !recovers);
+   assert(!ring.sched.pause_submit && ring.sched.work_free_job.queued);pending_once();
+  }
+ }
 
  /* Link disappears during queue reset: keep the initial dump, skip full reset. */
  setup();missing_at=2;timeout();
@@ -323,7 +389,7 @@ int main(void) {
  /* Already unplugged remains the original early-exit path. */
  setup();unplugged=1;timeout();
  assert(!config_reads && !dumps && !stops && !arms && !exits);
- puts("PASS: early/late PCI loss, real workqueue controls, in-flight completion/timer cancellation, multiple pending jobs, retained callbacks/cleanup, healthy recovery and VF bypass");
+ puts("PASS: completed-job bypass, reset-domain busy/serialization/unlock, PCI loss, workqueue/timer races, pending-job ownership, healthy recovery and VF bypass");
  return 0;
 }
 '''

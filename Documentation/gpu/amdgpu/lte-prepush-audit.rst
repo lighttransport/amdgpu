@@ -187,3 +187,42 @@ callback wrapper's rearm, not every external trigger or all device MMIO.
 PCI error recovery/PM concurrency, real reset/rebind, firmware timing and
 hardware stability remain unvalidated. No push, install, live reset or
 reboot was performed during the audit.
+
+
+Guard audit round 2, 2026-10-31
+-------------------------------
+
+The next pass on baseline f915ad07e found two driver liveness defects:
+
+* An already completed job could still park its queue on a PCI-read error.
+  The callback now bypasses recovery before probing a signaled finished
+  fence, and rechecks completion after a failed first probe. The old
+  completed-job test accepted parking and was corrected; the old callback
+  fails the new assertion. Completion during the first read is covered too.
+* A PCI recovery writer could repair/resume the queue between a failed
+  guard probe and its parking call. Each probe now uses a nonblocking
+  reset-domain read lock, held through parking on failure. A busy writer
+  defers recovery without hardware access. Writers can resume after park,
+  rather than before a stale park. The read lock is dropped before
+  coredump/hive handling and full reset, avoiding inverse lock ordering
+  and read-to-write upgrade. All exits balance the reader.
+
+The deterministic test models domain ownership, writer arrival/resume,
+entry/late contention and unlocked full-reset entry. An early-unlock
+mutation reproduces the wrong final paused state; removing either
+completion check also fails. Existing workqueue/timer, multi-job,
+callback/cleanup and VF checks still pass. All six suites pass with fatal
+UBSan. This is not a kernel race, PCI AER or runtime-PM hardware test.
+
+Separate Pearl integration fixes reuse cached stock modules without
+headers, confirm stock installation before unregistering LTE, and use a
+numbered Pearl DKMS version before the provenance hash. The older hash
+names did not order releases and could select an older registered driver
+on autoinstall. Twenty-two isolated script tests cover these cases.
+
+The guarded source was recompiled and amdgpu.ko relinked for
+7.0.0-42-generic using the existing successful full DKMS build tree's kernel
+module target directly. Nine module artifacts remain, thirteen overlay
+sources match after vendor CONFIG normalization, and amdgpu_job.c emits no
+warnings. Checkpatch and whitespace checks pass. No driver installation,
+push, live reset, power write or reboot was performed.

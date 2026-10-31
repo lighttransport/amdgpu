@@ -93,6 +93,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 	struct amdgpu_task_info *ti = NULL;
 	struct amdgpu_device *adev = ring->adev;
 	enum drm_gpu_sched_stat status = DRM_GPU_SCHED_STAT_NO_HANG;
+	bool reset_domain_locked = false;
 	int idx, r;
 
 	if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
@@ -103,9 +104,24 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 		return DRM_GPU_SCHED_STAT_ENODEV;
 	}
 
-	/* Do not dump registers or reset queues on an inaccessible PF. */
-	if (!amdgpu_sriov_vf(adev) && amdgpu_device_bus_status_check(adev))
-		goto device_lost;
+	/* A completed job must not park the scheduler on a false timeout. */
+	if (dma_fence_is_signaled(&s_job->s_fence->finished))
+		goto exit;
+
+	/* Serialize PCI probing and parking with reset-domain writers. */
+	if (!amdgpu_sriov_vf(adev)) {
+		if (!down_read_trylock(&adev->reset_domain->sem))
+			goto exit;
+		reset_domain_locked = true;
+		if (amdgpu_device_bus_status_check(adev)) {
+			/* Completion may have raced the configuration read. */
+			if (dma_fence_is_signaled(&s_job->s_fence->finished))
+				goto exit;
+			goto device_lost;
+		}
+		up_read(&adev->reset_domain->sem);
+		reset_domain_locked = false;
+	}
 
 	/*
 	 * Do the coredump immediately after a job timeout to get a very
@@ -186,9 +202,15 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 		set_bit(AMDGPU_SKIP_COREDUMP, &reset_context.flags);
 
 		/* The device may have disappeared during per-ring recovery. */
-		if (!amdgpu_sriov_vf(adev) &&
-		    amdgpu_device_bus_status_check(adev))
-			goto device_lost;
+		if (!amdgpu_sriov_vf(adev)) {
+			if (!down_read_trylock(&adev->reset_domain->sem))
+				goto exit;
+			reset_domain_locked = true;
+			if (amdgpu_device_bus_status_check(adev))
+				goto device_lost;
+			up_read(&adev->reset_domain->sem);
+			reset_domain_locked = false;
+		}
 
 		r = amdgpu_device_gpu_recover(ring->adev, job, &reset_context);
 		if (r)
@@ -215,6 +237,8 @@ device_lost:
 	spin_unlock(&ring->sched.job_list_lock);
 	status = DRM_GPU_SCHED_STAT_ENODEV;
 exit:
+	if (reset_domain_locked)
+		up_read(&adev->reset_domain->sem);
 	amdgpu_vm_put_task_info(ti);
 	drm_dev_exit(idx);
 	/* NO_HANG keeps the existing job reinsertion policy on other paths. */

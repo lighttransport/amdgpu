@@ -77,7 +77,8 @@ static u32 smu_min_ppt_limit(struct smu_context *smu, u32 limit_type,
 	if (!amdgpu_smu_min_power_cap || smu->is_apu || amdgpu_sriov_vf(adev) ||
 	    limit_type != SMU_DEFAULT_PPT_LIMIT ||
 	    amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(12, 0, 1) ||
-	    amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 2))
+	    (amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 2) &&
+	     amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 3)))
 		return min_limit;
 
 	return min_t(u32, amdgpu_smu_min_power_cap, min_limit);

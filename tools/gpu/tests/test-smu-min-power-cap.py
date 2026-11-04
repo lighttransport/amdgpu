@@ -88,8 +88,9 @@ static void init(void) {
 main = r'''
 int main(void) {
  u32 v;
+ for (int mp1 = 2; mp1 <= 3; mp1++)
  for (int power = 0; power < 2; power++) for (int od = 0; od < 2; od++) {
-  init(); adev.pm.ac_power = power == SMU_POWER_SOURCE_AC; smu.od_enabled = od;
+  init(); adev.mp1 = IP_VERSION(14,0,mp1); adev.pm.ac_power = power == SMU_POWER_SOURCE_AC; smu.od_enabled = od;
   assert(smu_get_ppt_limit(&smu, &v, PP_PWR_LIMIT_MIN, PP_PWR_TYPE_SUSTAINED) == 0 && v == (od ? 200U : 212U));
   assert(smu_set_ppt_limit(&smu, SMU_DEFAULT_PPT_LIMIT, 170) == -EINVAL && writes == 0);
   amdgpu_smu_min_power_cap = 150;
@@ -114,7 +115,7 @@ int main(void) {
  for (int other = 0; other < 4; other++) {
   init(); amdgpu_smu_min_power_cap = 150;
   if (other == 0) adev.gc = IP_VERSION(12,0,0);
-  if (other == 1) adev.mp1 = IP_VERSION(14,0,3);
+  if (other == 1) adev.mp1 = IP_VERSION(14,0,4);
   if (other == 2) smu.is_apu = true;
   if (other == 3) adev.vf = true;
   assert(smu_get_ppt_limit(&smu, &v, PP_PWR_LIMIT_MIN, PP_PWR_TYPE_SUSTAINED) == 0 && v == 212);

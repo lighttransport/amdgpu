@@ -132,6 +132,10 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 	if (!amdgpu_sriov_vf(adev))
 		amdgpu_job_core_dump(adev, job);
 
+	/* IP dumps can outlast the hang: avoid resetting a completed job. */
+	if (dma_fence_is_signaled(&s_job->s_fence->finished))
+		goto exit;
+
 	if (amdgpu_gpu_recovery &&
 	    amdgpu_ring_is_reset_type_supported(ring, AMDGPU_RESET_TYPE_SOFT_RECOVERY) &&
 	    amdgpu_ring_soft_recovery(ring, job->vmid, s_job->s_fence->parent)) {

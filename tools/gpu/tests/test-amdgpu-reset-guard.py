@@ -128,7 +128,7 @@ static unsigned teardown_warnings;
 static bool reset_pending, reset_during_ring;
 static struct amdgpu_reset_domain reset_domain;
 static struct amdgpu_task_info task;
-static void (*stop_hook)(void), (*config_hook)(void), (*reset_resume_hook)(void);
+static void (*dump_hook)(void), (*stop_hook)(void), (*config_hook)(void), (*reset_resume_hook)(void);
 int down_read_trylock(struct rw_semaphore *s) {
  read_attempts++;if(s->writer) return false;s->readers++;read_locks++;return true;
 }
@@ -173,7 +173,7 @@ static bool drm_dev_enter(struct amdgpu_device *a,int *idx) {
  (void)a; enters++; *idx=9; return !unplugged;
 }
 static void drm_dev_exit(int idx) { assert(idx==9); exits++; }
-static void amdgpu_job_core_dump(struct amdgpu_device *a,struct amdgpu_job *j) { (void)a;(void)j;assert(!reset_domain.sem.readers);dumps++; }
+static void amdgpu_job_core_dump(struct amdgpu_device *a,struct amdgpu_job *j) { (void)a;(void)j;assert(!reset_domain.sem.readers);dumps++;if(dump_hook) dump_hook(); }
 static bool amdgpu_ring_is_reset_type_supported(struct amdgpu_ring *r,int t) { (void)r;return supported&t; }
 static bool amdgpu_ring_soft_recovery(struct amdgpu_ring *r,int v,struct dma_fence *f) { (void)r;(void)v;(void)f;return soft_ok; }
 static struct amdgpu_task_info *amdgpu_vm_get_task_info_pasid(struct amdgpu_device *a,int p) { (void)a;(void)p;task_gets++;return &task; }
@@ -263,7 +263,7 @@ static void setup(void) {
  teardown_warnings=0;ring.sched.ready=true;
  list_add(&job.base.list,&ring.sched.pending_list);
  amdgpu_gpu_recovery=recovery_allowed=1;supported=3;
- config_reads=missing_at=config_error=unplugged=soft_ok=0;stop_hook=config_hook=NULL;
+ config_reads=missing_at=config_error=unplugged=soft_ok=0;dump_hook=stop_hook=config_hook=NULL;
  read_attempts=read_locks=read_unlocks=reset_completions=0;
  reset_pending=reset_during_ring=false;reset_resume_hook=NULL;
  ring_ret=ip_ret=-EIO;recover_ret=0;
@@ -288,6 +288,7 @@ static void finish_while_stopping(void) {
  /* A timer queued by in-flight work must also be canceled by the guard. */
  mod_delayed_work(ring.sched.timeout_wq,&ring.sched.work_tdr,13);
 }
+static void fail_during_dump(void) { drm_sched_job_done(&job.base,-EIO); }
 static void finish_during_config_read(void) { drm_sched_job_done(&job.base,0); }
 static void resume_after_reset(void) {
  assert(reset_domain.sem.writer && !reset_domain.sem.readers);
@@ -311,6 +312,18 @@ static void request_reset_and_free(void) {
  request_reset_during_config_read();reset_resume_hook=resume_and_free_after_reset;
 }
 int main(void) {
+ setup();dump_hook=fail_during_dump;timeout();
+ assert(dumps==1 && !stops && !ring_resets && !ip_resets && !recovers);
+ assert(sf.finished.status==-EIO && sf.finished.error==-EIO);
+ pending_once();
+ /* Completion during an IP dump is a false timeout, including errors. */
+ setup();dump_hook=finish_during_config_read;timeout();
+ assert(dumps==1 && !stops && !ring_resets && !ip_resets && !recovers);
+ assert(sf.finished.status==1 && !sf.finished.error && !ring.sched.pause_submit);
+ pending_once();
+ struct drm_sched_job *dump_done=drm_sched_get_finished_job(&ring.sched);
+ assert(dump_done==&job.base);free_job(dump_done);assert(frees==1);
+
  /* Parked jobs must be freed on teardown without resuming submission. */
  for(int completed=0;completed<3;completed++) {
   setup();missing_at=1;timeout();

@@ -2257,6 +2257,7 @@ static int amdgpu_ttm_alloc_mmio_remap_bo(struct amdgpu_device *adev)
 	 * replaced below with a fixed MMIO_REMAP placement.
 	 */
 	memset(&bp, 0, sizeof(bp));
+	bp.sandbox_explicit = true;
 	bp.type        = ttm_bo_type_device;
 	bp.size        = AMDGPU_GPU_PAGE_SIZE;
 	bp.byte_align  = AMDGPU_GPU_PAGE_SIZE;

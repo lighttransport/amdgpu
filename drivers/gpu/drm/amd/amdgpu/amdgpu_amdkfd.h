@@ -96,6 +96,8 @@ struct kgd_mem {
 	uint32_t gem_handle;
 	bool aql_queue;
 	bool is_imported;
+	/* Import alias metadata consumes one BO unit independently of CRIU flags. */
+	bool sandbox_import_charged;
 };
 
 /* KFD Memory Eviction */
@@ -261,6 +263,11 @@ int amdgpu_amdkfd_set_sigbus_delay(struct task_struct *task, u32 ms)
 }
 #endif
 /* Shared API */
+struct amdgpu_sandbox;
+int amdgpu_amdkfd_alloc_kernel_mem_owned(struct amdgpu_device *adev, size_t size,
+				u32 domain, void **mem_obj, uint64_t *gpu_addr,
+				void **cpu_ptr, bool mqd_gfx9, bool is_uswc_mode,
+				struct amdgpu_sandbox *sandbox);
 int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
 				u32 domain, void **mem_obj, uint64_t *gpu_addr,
 				void **cpu_ptr, bool mqd_gfx9, bool is_uswc_mode);

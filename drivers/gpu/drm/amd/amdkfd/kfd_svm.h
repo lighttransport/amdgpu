@@ -107,7 +107,10 @@ struct svm_work_list_item {
  * allocated from system memory ram or device vram, and migrate from ram to vram
  * or from vram to ram.
  */
+struct amdgpu_sb_range;
+
 struct svm_range {
+	struct amdgpu_sb_range *sandbox_range;
 	struct svm_range_list		*svms;
 	struct mutex			migrate_mutex;
 	unsigned long			start;

@@ -347,9 +347,10 @@ void amdgpu_amdkfd_clear_kfd_mapping(struct amdgpu_device *adev)
 #endif
 }
 
-int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
+int amdgpu_amdkfd_alloc_kernel_mem_owned(struct amdgpu_device *adev, size_t size,
 				u32 domain, void **mem_obj, uint64_t *gpu_addr,
-				void **cpu_ptr, bool cp_mqd_gfx9, bool is_uswc_mode)
+				void **cpu_ptr, bool cp_mqd_gfx9, bool is_uswc_mode,
+				struct amdgpu_sandbox *sandbox)
 {
 	struct amdgpu_bo *bo = NULL;
 	struct amdgpu_bo_param bp;
@@ -357,6 +358,8 @@ int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
 	void *cpu_ptr_tmp = NULL;
 
 	memset(&bp, 0, sizeof(bp));
+	bp.sandbox = sandbox;
+	bp.sandbox_explicit = true;
 	bp.size = size;
 	bp.byte_align = PAGE_SIZE;
 	bp.domain = domain;
@@ -423,6 +426,15 @@ allocate_mem_reserve_bo_failed:
 	return r;
 }
 
+int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
+				u32 domain, void **mem_obj, uint64_t *gpu_addr,
+				void **cpu_ptr, bool cp_mqd_gfx9, bool is_uswc_mode)
+{
+	/* Device-global pools have no process owner. */
+	return amdgpu_amdkfd_alloc_kernel_mem_owned(adev, size, domain, mem_obj,
+			gpu_addr, cpu_ptr, cp_mqd_gfx9, is_uswc_mode, NULL);
+}
+
 void amdgpu_amdkfd_free_kernel_mem(struct amdgpu_device *adev, void **mem_obj)
 {
 	struct amdgpu_bo **bo = (struct amdgpu_bo **) mem_obj;
@@ -432,7 +444,9 @@ void amdgpu_amdkfd_free_kernel_mem(struct amdgpu_device *adev, void **mem_obj)
 
 	(void)amdgpu_bo_reserve(*bo, true);
 	amdgpu_bo_kunmap(*bo);
-	amdgpu_bo_unpin(*bo);
+	/* Hibernation may already have unpinned a private MQD. */
+	if ((*bo)->tbo.pin_count)
+		amdgpu_bo_unpin(*bo);
 	amdgpu_bo_unreserve(*bo);
 	amdgpu_bo_unref(bo);
 }
@@ -446,6 +460,8 @@ int amdgpu_amdkfd_alloc_gws(struct amdgpu_device *adev, size_t size,
 	int r;
 
 	memset(&bp, 0, sizeof(bp));
+	/* Device-wide GWS pool, independent of any requesting process. */
+	bp.sandbox_explicit = true;
 	bp.size = size;
 	bp.byte_align = 1;
 	bp.domain = AMDGPU_GEM_DOMAIN_GWS;

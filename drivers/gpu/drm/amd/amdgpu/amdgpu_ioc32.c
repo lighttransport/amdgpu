@@ -33,10 +33,19 @@
 #include <drm/drm_ioctl.h>
 
 #include "amdgpu_drv.h"
+#include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 
 long amdgpu_kms_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	unsigned int nr = DRM_IOCTL_NR(cmd);
+	struct drm_file *file_priv = filp->private_data;
+	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
+	int ret;
+
+	ret = amdgpu_sb_identity(fpriv->sandbox, drm_to_adev(file_priv->minor->dev));
+	if (ret)
+		return ret;
 
 	if (nr < DRM_COMMAND_BASE)
 		return drm_compat_ioctl(filp, cmd, arg);

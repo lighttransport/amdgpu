@@ -60,7 +60,7 @@ enum drm_gpu_sched_stat { DRM_GPU_SCHED_STAT_RESET, DRM_GPU_SCHED_STAT_ENODEV, D
 struct work_struct { bool queued, free_worker; };
 struct delayed_work { struct work_struct work; struct { unsigned long expires; } timer; bool pending; };
 struct drm_sched_job;
-struct dma_fence { int status, error; bool callback; unsigned long flags, timestamp; int *lock; struct drm_sched_job *owner; };
+struct dma_fence { uint64_t context, seqno; int status, error; bool callback; unsigned long flags, timestamp; int *lock; struct drm_sched_job *owner; };
 struct drm_sched_fence { struct dma_fence finished, scheduled, *parent; struct drm_gpu_scheduler *sched; };
 struct drm_sched_job;
 struct drm_sched_backend_ops {
@@ -97,6 +97,7 @@ struct amdgpu_ring {
  struct { int (*reset)(void); } *funcs;
 };
 struct amdgpu_job {
+ void *sandbox;
  struct drm_sched_job base; int pasid, vmid; struct dma_fence *hw_fence;
 };
 struct amdgpu_reset_context {
@@ -173,6 +174,7 @@ static bool drm_dev_enter(struct amdgpu_device *a,int *idx) {
  (void)a; enters++; *idx=9; return !unplugged;
 }
 static void drm_dev_exit(int idx) { assert(idx==9); exits++; }
+static inline void amdgpu_sb_fault(void *p,uint64_t context,uint64_t sequence) { (void)p;(void)context;(void)sequence; }
 static void amdgpu_job_core_dump(struct amdgpu_device *a,struct amdgpu_job *j) { (void)a;(void)j;assert(!reset_domain.sem.readers);dumps++;if(dump_hook) dump_hook(); }
 static bool amdgpu_ring_is_reset_type_supported(struct amdgpu_ring *r,int t) { (void)r;return supported&t; }
 static bool amdgpu_ring_soft_recovery(struct amdgpu_ring *r,int v,struct dma_fence *f) { (void)r;(void)v;(void)f;return soft_ok; }

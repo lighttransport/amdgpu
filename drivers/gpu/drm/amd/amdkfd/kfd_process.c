@@ -41,6 +41,7 @@
 struct mm_struct;
 
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_svm.h"
 #include "kfd_trace.h"
@@ -1430,7 +1431,8 @@ static void kfd_process_wq_release(struct work_struct *work)
 	mutex_destroy(&p->mutex);
 
 	put_task_struct(p->lead_thread);
-
+	amdgpu_sb_client_del(p->sandbox_client);
+	amdgpu_sb_put(p->sandbox);
 	kfree(p);
 }
 
@@ -1490,6 +1492,7 @@ void kfd_process_notifier_release_internal(struct kfd_process *p)
 	struct mm_struct *mm = p->mm;
 #endif
 
+	amdgpu_sb_client_quiesce(p->sandbox_client);
 	kfd_process_table_remove(p);
 	cancel_delayed_work_sync(&p->eviction_work);
 	cancel_delayed_work_sync(&p->restore_work);
@@ -1833,6 +1836,52 @@ void kfd_process_set_trap_pc_sampling_flag(struct qcm_process_device *qpd,
  * On return the kfd_process is fully operational and will be freed when the
  * mm is released
  */
+static bool kfd_sb_process_get(void *data)
+{
+	struct kfd_process *p = data;
+
+	return kref_get_unless_zero(&p->ref);
+}
+
+static void kfd_sb_process_put(void *data)
+{
+	kfd_unref_process(data);
+}
+
+static int kfd_sb_process_evict(void *data)
+{
+	struct kfd_process *p = data;
+	int i, ret = 0, r;
+
+	if (!mutex_trylock(&p->mutex))
+		return -EAGAIN;
+	if (!p->mm)
+		goto out;
+	for (i = 0; i < p->n_pdds; i++) {
+		struct kfd_process_device *pdd = p->pdds[i];
+		struct amdgpu_device *adev = pdd->dev->adev;
+		int idx;
+
+		if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
+			ret = -ENODEV;
+			continue;
+		}
+		if (!down_read_trylock(&adev->reset_domain->sem)) {
+			ret = -EAGAIN;
+			drm_dev_exit(idx);
+			continue;
+		}
+		r = kfd_sandbox_evict_process_device(pdd);
+		up_read(&adev->reset_domain->sem);
+		drm_dev_exit(idx);
+		if (r)
+			ret = r;
+	}
+out:
+	mutex_unlock(&p->mutex);
+	return ret;
+}
+
 struct kfd_process *create_process(const struct task_struct *thread, bool primary)
 {
 	struct kfd_process *process;
@@ -1851,6 +1900,15 @@ struct kfd_process *create_process(const struct task_struct *thread, bool primar
 	process->lead_thread = thread->group_leader;
 	process->n_pdds = 0;
 	process->queues_paused = false;
+	process->sandbox = amdgpu_sb_current(NULL);
+	if (IS_ERR(process->sandbox)) {
+		err = PTR_ERR(process->sandbox);
+		process->sandbox = NULL;
+		goto err_event_init;
+	}
+	err = amdgpu_sb_check(process->sandbox);
+	if (err)
+		goto err_event_init;
 
 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
@@ -1881,6 +1939,14 @@ struct kfd_process *create_process(const struct task_struct *thread, bool primar
 	err = svm_range_list_init(process);
 	if (err)
 		goto err_init_svm_range_list;
+
+	process->sandbox_client = amdgpu_sb_client_add(process->sandbox, process,
+		kfd_sb_process_get, kfd_sb_process_put, kfd_sb_process_evict);
+	if (IS_ERR(process->sandbox_client)) {
+		err = PTR_ERR(process->sandbox_client);
+		process->sandbox_client = NULL;
+		goto err_sb_client;
+	}
 
 	/* alloc_notifier needs to find the process in the hash table */
 	hash_add_rcu(kfd_processes_table, &process->kfd_processes,
@@ -1936,6 +2002,8 @@ err_alloc_id:
 	kfd_process_free_id(process);
 err_register_notifier:
 	hash_del_rcu(&process->kfd_processes);
+err_sb_client:
+	amdgpu_sb_client_del(process->sandbox_client);
 	svm_range_list_fini(process);
 err_init_svm_range_list:
 	kfd_process_free_outstanding_kfd_bos(process);
@@ -1945,6 +2013,7 @@ err_init_apertures:
 err_process_pqm_init:
 	kfd_event_free_process(process);
 err_event_init:
+	amdgpu_sb_put(process->sandbox);
 	mutex_destroy(&process->mutex);
 	kfree(process);
 err_alloc_process:
@@ -2038,6 +2107,12 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
 	ret = amdgpu_file_to_fpriv(drm_file, &drv_priv);
 	if (ret)
 		return ret;
+	if (drv_priv->sandbox != pdd->process->sandbox ||
+	    !amdgpu_sb_allows(pdd->process->sandbox, pdd->dev->adev))
+		return -EXDEV;
+	ret = amdgpu_sb_check(pdd->process->sandbox);
+	if (ret)
+		return ret;
 	avm = &drv_priv->vm;
 
 	p = pdd->process;
@@ -2101,6 +2176,11 @@ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_node *dev,
 	struct kfd_process_device *pdd;
 	int err;
 
+	if (!amdgpu_sb_allows(p->sandbox, dev->adev))
+		return ERR_PTR(-EPERM);
+	err = amdgpu_sb_check(p->sandbox);
+	if (err)
+		return ERR_PTR(err);
 	pdd = kfd_get_process_device_data(dev, p);
 	if (!pdd) {
 		dev_err(dev->adev->dev, "Process device data doesn't exist\n");

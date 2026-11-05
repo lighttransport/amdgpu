@@ -279,10 +279,10 @@ static int mes_userq_create_ctx_space(struct amdgpu_userq_mgr *uq_mgr,
 
 	/* The FW expects at least one page space allocated for gang ctx. */
 	size = AMDGPU_USERQ_GANG_CTX_SZ;
-	r = amdgpu_bo_create_kernel(uq_mgr->adev, size, 0,
+	r = amdgpu_bo_create_kernel_owned(uq_mgr->adev, size, 0,
 				    AMDGPU_GEM_DOMAIN_GTT,
 				    &ctx->obj, &ctx->gpu_addr,
-				    &ctx->cpu_ptr);
+				    &ctx->cpu_ptr, queue->sandbox);
 	if (r) {
 		DRM_ERROR("Failed to allocate ctx space bo for userqueue, err:%d\n", r);
 		return r;
@@ -301,11 +301,12 @@ static int mes_userq_create_proc_ctx_space(struct amdgpu_userq_mgr *uq_mgr)
 	 * calls helpers like amdgpu_bo_pin() and memset() unconditionally
 	 */
 	if (!uq_mgr->proc_ctx_obj.obj) {
-		r = amdgpu_bo_create_kernel(uq_mgr->adev, AMDGPU_USERQ_PROC_CTX_SZ,
+		r = amdgpu_bo_create_kernel_owned(uq_mgr->adev, AMDGPU_USERQ_PROC_CTX_SZ,
 					    0, AMDGPU_GEM_DOMAIN_GTT,
 					    &uq_mgr->proc_ctx_obj.obj,
 					    &uq_mgr->proc_ctx_obj.gpu_addr,
-					    &uq_mgr->proc_ctx_obj.cpu_ptr);
+					    &uq_mgr->proc_ctx_obj.cpu_ptr,
+				    uq_mgr_to_fpriv(uq_mgr)->sandbox);
 
 		if (!r)
 			memset(uq_mgr->proc_ctx_obj.cpu_ptr, 0, AMDGPU_USERQ_PROC_CTX_SZ);
@@ -333,11 +334,11 @@ static int mes_userq_mqd_create(struct amdgpu_usermode_queue *queue,
 		return -ENOMEM;
 	}
 
-	r = amdgpu_bo_create_kernel(adev,
+	r = amdgpu_bo_create_kernel_owned(adev,
 				    AMDGPU_MQD_SIZE_ALIGN(mqd_hw_default->mqd_size),
 				    0, AMDGPU_GEM_DOMAIN_GTT,
 				    &queue->mqd.obj, &queue->mqd.gpu_addr,
-				    &queue->mqd.cpu_ptr);
+				    &queue->mqd.cpu_ptr, queue->sandbox);
 	if (r) {
 		DRM_ERROR("Failed to create MQD object for userqueue\n");
 		goto free_props;

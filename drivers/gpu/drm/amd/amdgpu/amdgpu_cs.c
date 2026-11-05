@@ -36,6 +36,7 @@
 
 #include "amdgpu_cs.h"
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_gem.h"
@@ -305,6 +306,10 @@ static int amdgpu_cs_pass1(struct amdgpu_cs_parser *p,
 #endif
 		if (ret)
 			goto free_all_kdata;
+		ret = amdgpu_sb_charge(fpriv->sandbox, AMDGPU_SB_JOBS, 1);
+		if (ret)
+			goto free_all_kdata;
+		p->jobs[i]->sandbox = amdgpu_sb_get(fpriv->sandbox);
 		switch (p->adev->enforce_isolation[fpriv->xcp_id]) {
 		case AMDGPU_ENFORCE_ISOLATION_DISABLE:
 		default:

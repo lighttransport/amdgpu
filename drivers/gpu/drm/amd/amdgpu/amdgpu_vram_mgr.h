@@ -49,7 +49,10 @@ struct amdgpu_vram_block_info {
 	struct amdgpu_vres_task task;
 };
 
+struct amdgpu_sandbox;
+
 struct amdgpu_vram_mgr_resource {
+	struct amdgpu_sandbox *sandbox;
 	struct ttm_resource base;
 	struct list_head blocks;
 	unsigned long flags;

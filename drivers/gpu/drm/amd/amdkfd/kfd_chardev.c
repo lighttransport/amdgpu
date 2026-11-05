@@ -39,6 +39,7 @@
 #include <linux/dma-buf.h>
 #include <linux/processor.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_svm.h"
 #include "kfd_ipc.h"
@@ -175,6 +176,14 @@ static int kfd_open(struct inode *inode, struct file *filep)
 	if (IS_ERR(process))
 		return PTR_ERR(process);
 
+	{
+		int ret = amdgpu_sb_check_current(process->sandbox, NULL);
+
+		if (ret) {
+			kfd_unref_process(process);
+			return ret;
+		}
+	}
 	/* filep now owns the reference returned by kfd_create_process */
 	filep->private_data = process;
 
@@ -4022,6 +4031,10 @@ static long kfd_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	 * processes need to create their own KFD device context.
 	 */
 	process = filep->private_data;
+	retcode = amdgpu_sb_check_current(process->sandbox, NULL);
+	if (retcode)
+		goto err_i1;
+
 
 	rcu_read_lock();
 	if ((ioctl->flags & KFD_IOC_FLAG_CHECKPOINT_RESTORE) &&
@@ -4180,6 +4193,7 @@ static int kfd_mmap(struct file *filep, struct vm_area_struct *vma)
 	struct kfd_node *dev = NULL;
 	unsigned long mmap_offset;
 	unsigned int gpu_id;
+	int ret;
 
 	process = filep->private_data;
 	if (!process)
@@ -4187,6 +4201,10 @@ static int kfd_mmap(struct file *filep, struct vm_area_struct *vma)
 
 	if (process->lead_thread != current->group_leader)
 		return -EBADF;
+
+	ret = amdgpu_sb_check_current(process->sandbox, NULL);
+	if (ret)
+		return ret;
 
 	mmap_offset = vma->vm_pgoff << PAGE_SHIFT;
 	gpu_id = KFD_MMAP_GET_GPU_ID(mmap_offset);

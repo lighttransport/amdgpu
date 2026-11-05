@@ -25,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/overflow.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_topology.h"
 #include "kfd_svm.h"
 
@@ -83,6 +84,10 @@ int init_queue(struct queue **q, const struct queue_properties *properties)
 
 void uninit_queue(struct queue *q)
 {
+	if (q) {
+		amdgpu_sb_uncharge(q->sandbox, AMDGPU_SB_QUEUES, 1);
+		amdgpu_sb_put(q->sandbox);
+	}
 	kfree(q);
 }
 

@@ -32,6 +32,7 @@
  */
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_display.h"
 #include "amdgpu_gem.h"
 #include "amdgpu_dma_buf.h"
@@ -43,6 +44,29 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-fence-array.h>
 #include <linux/pci-p2pdma.h>
+
+static int amdgpu_sb_prime_import_check(struct drm_device *dev, struct dma_buf *buf)
+{
+	struct amdgpu_sandbox *current_sb = amdgpu_sb_current(drm_to_adev(dev));
+	struct amdgpu_sandbox *owner = NULL;
+	int ret;
+
+	if (IS_ERR(current_sb))
+		return PTR_ERR(current_sb);
+	if (buf->ops == &amdgpu_dmabuf_ops)
+		owner = gem_to_amdgpu_bo(buf->priv)->sandbox;
+	ret = current_sb == owner ? amdgpu_sb_check(owner) : -EXDEV;
+	amdgpu_sb_put(current_sb);
+	return ret;
+}
+
+static int amdgpu_sb_dmabuf_mmap(struct dma_buf *buf, struct vm_area_struct *vma)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(buf->priv);
+	int ret = amdgpu_sb_check_current(bo->sandbox, amdgpu_ttm_adev(bo->tbo.bdev));
+
+	return ret ? ret : drm_gem_dmabuf_mmap(buf, vma);
+}
 
 #ifdef HAVE_STRUCT_DRM_DRV_GEM_OPEN_OBJECT_CALLBACK
 /**
@@ -69,6 +93,10 @@ int amdgpu_gem_prime_mmap(struct drm_gem_object *obj,
 
         if (adev == NULL)
                 return -ENODEV;
+
+	ret = amdgpu_sb_check_current(bo->sandbox, adev);
+	if (ret)
+		return ret;
 
         /* Check for valid size. */
         if (asize < vma->vm_end - vma->vm_start)
@@ -153,6 +181,12 @@ static int amdgpu_dma_buf_map_attach(struct dma_buf *dma_buf,
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	long r;
+
+	r = amdgpu_sb_check_current(bo->sandbox, adev);
+	if (r)
+		return r;
+	if (bo->sandbox && attach->dev != adev->dev)
+		return -EXDEV;
 
 	r = drm_gem_map_attach(dma_buf, attach);
 
@@ -259,6 +293,12 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	int r;
+
+	r = amdgpu_sb_check_current(bo->sandbox, adev);
+	if (r)
+		return r;
+	if (bo->sandbox && attach->dev != adev->dev)
+		return -EXDEV;
 
 	/*
 	 * Disable peer-to-peer access for DCC-enabled VRAM surfaces on GFX12+.
@@ -558,7 +598,7 @@ const struct dma_buf_ops amdgpu_dmabuf_ops = {
 #endif
 	.release = drm_gem_dmabuf_release,
 	.begin_cpu_access = amdgpu_dma_buf_begin_cpu_access,
-	.mmap = drm_gem_dmabuf_mmap,
+	.mmap = amdgpu_sb_dmabuf_mmap,
 #ifdef HAVE_DRM_GEM_DMABUF_VMAP_HAS_IOSYS_MAP_ARG
 	.vmap = amdgpu_dma_buf_vmap,
 	.vunmap = amdgpu_dma_buf_vunmap,
@@ -719,6 +759,11 @@ struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
 					    struct dma_buf *dma_buf)
 {
 	struct drm_gem_object *obj;
+
+	int ret = amdgpu_sb_prime_import_check(dev, dma_buf);
+
+	if (ret)
+		return ERR_PTR(ret);
 
 	if (dma_buf->ops == &amdgpu_dmabuf_ops) {
 		obj = dma_buf->priv;
@@ -890,6 +935,11 @@ struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
 {
 	struct dma_buf_attachment *attach;
 	struct drm_gem_object *obj;
+
+	int ret = amdgpu_sb_prime_import_check(dev, dma_buf);
+
+	if (ret)
+		return ERR_PTR(ret);
 
 	if (dma_buf->ops == &amdgpu_dmabuf_ops) {
 		obj = dma_buf->priv;

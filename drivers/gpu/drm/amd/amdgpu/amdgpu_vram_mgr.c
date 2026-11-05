@@ -28,6 +28,7 @@
 #include <drm/drm_buddy.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_vm.h"
 #include "amdgpu_res_cursor.h"
 #include "atom.h"
@@ -490,6 +491,10 @@ static int amdgpu_vram_mgr_new(struct ttm_resource_manager *man,
 		return -ENOMEM;
 
 	ttm_resource_init(tbo, place, &vres->base);
+	r = amdgpu_sb_charge_vram(bo->sandbox, vres->base.size);
+	if (r)
+		goto error_fini;
+	vres->sandbox = amdgpu_sb_get(bo->sandbox);
 
 	/* bail out quickly if there's likely not enough VRAM for this BO */
 	if (ttm_resource_manager_usage(man) > max_bytes) {
@@ -624,6 +629,8 @@ error_free_blocks:
 	gpu_buddy_free_list(mm, &vres->blocks, 0);
 	mutex_unlock(&mgr->lock);
 error_fini:
+	amdgpu_sb_uncharge(vres->sandbox, AMDGPU_SB_VRAM, vres->base.size);
+	amdgpu_sb_put(vres->sandbox);
 	ttm_resource_fini(man, &vres->base);
 	kfree(vres);
 
@@ -662,6 +669,8 @@ static void amdgpu_vram_mgr_del(struct ttm_resource_manager *man,
 
 	atomic64_sub(vis_usage, &mgr->vis_usage);
 
+	amdgpu_sb_uncharge(vres->sandbox, AMDGPU_SB_VRAM, res->size);
+	amdgpu_sb_put(vres->sandbox);
 	ttm_resource_fini(man, res);
 	kfree(vres);
 }

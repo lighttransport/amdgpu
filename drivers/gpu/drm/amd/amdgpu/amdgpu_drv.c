@@ -41,6 +41,7 @@
 #include <linux/vga_switcheroo.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_lte_debug.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_dma_buf.h"
@@ -2626,6 +2627,7 @@ amdgpu_pci_remove(struct pci_dev *pdev)
 	struct drm_device *dev = pci_get_drvdata(pdev);
 	struct amdgpu_device *adev = drm_to_adev(dev);
 
+	amdgpu_sb_device_gone(adev);
 	amdgpu_ras_eeprom_check_and_recover(adev);
 	amdgpu_xcp_dev_unplug(adev);
 	amdgpu_gmc_prepare_nps_mode_change(adev);
@@ -3117,6 +3119,62 @@ static int amdgpu_drm_release(struct inode *inode, struct file *filp)
 	return drm_release(inode, filp);
 }
 
+static bool amdgpu_sb_file_get(void *data)
+{
+	struct file *file = data;
+
+	return get_file_active(&file) != NULL;
+}
+
+static void amdgpu_sb_file_put(void *data)
+{
+	fput(data);
+}
+
+static int amdgpu_sb_file_evict(void *data)
+{
+	struct file *file = data;
+	struct drm_file *drm_file = file->private_data;
+	struct amdgpu_fpriv *fpriv = drm_file->driver_priv;
+
+	int idx, ret;
+
+	if (!fpriv)
+		return 0;
+	if (!drm_dev_enter(adev_to_drm(fpriv->userq_mgr.adev), &idx))
+		return -ENODEV;
+	ret = amdgpu_userq_sandbox_quarantine(&fpriv->userq_mgr);
+	drm_dev_exit(idx);
+	return ret;
+}
+
+
+/* drm_open_helper publishes both private_data and drm_file::filp only after
+ * ->open_kms returns. Register the weak file owner here, before fd publication.
+ */
+static int amdgpu_drm_open(struct inode *inode, struct file *file)
+{
+	struct drm_file *drm_file;
+	struct amdgpu_fpriv *fpriv;
+	int ret;
+
+	ret = drm_open(inode, file);
+	if (ret)
+		return ret;
+	drm_file = file->private_data;
+	fpriv = drm_file->driver_priv;
+	fpriv->sandbox_client = amdgpu_sb_client_add(fpriv->sandbox, file,
+		amdgpu_sb_file_get, amdgpu_sb_file_put, amdgpu_sb_file_evict);
+	if (IS_ERR(fpriv->sandbox_client)) {
+		ret = PTR_ERR(fpriv->sandbox_client);
+		fpriv->sandbox_client = NULL;
+		amdgpu_drm_release(inode, file);
+		file->private_data = NULL;
+		return ret;
+	}
+	return 0;
+}
+
 long amdgpu_drm_ioctl(struct file *filp,
 		      unsigned int cmd, unsigned long arg)
 {
@@ -3125,6 +3183,13 @@ long amdgpu_drm_ioctl(struct file *filp,
 	long ret;
 
 	dev = file_priv->minor->dev;
+	if (file_priv->driver_priv) {
+		struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
+
+		ret = amdgpu_sb_identity(fpriv->sandbox, drm_to_adev(dev));
+		if (ret)
+			return ret;
+	}
 	ret = pm_runtime_get_sync(dev->dev);
 	if (ret < 0)
 		goto out;
@@ -3163,13 +3228,23 @@ static int amdgpu_flush(struct file *f, fl_owner_t id)
 	return timeout >= 0 ? 0 : timeout;
 }
 
+static int amdgpu_sb_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct drm_file *drm_file = file->private_data;
+	struct amdgpu_fpriv *fpriv = drm_file->driver_priv;
+	int ret;
+
+	ret = amdgpu_sb_check_current(fpriv->sandbox, drm_to_adev(drm_file->minor->dev));
+	return ret ? ret : amdkcl_drm_gem_mmap(file, vma);
+}
+
 static const struct file_operations amdgpu_driver_kms_fops = {
 	.owner = THIS_MODULE,
-	.open = drm_open,
+	.open = amdgpu_drm_open,
 	.flush = amdgpu_flush,
 	.release = amdgpu_drm_release,
 	.unlocked_ioctl = amdgpu_drm_ioctl,
-	.mmap = amdkcl_drm_gem_mmap,
+	.mmap = amdgpu_sb_mmap,
 	.poll = drm_poll,
 	.read = drm_read,
 #ifdef CONFIG_COMPAT
@@ -3399,8 +3474,17 @@ static int __init amdgpu_init(void)
 			"reporting any bugs unrelated to overdrive.\n");
 	}
 
+	r = amdgpu_sb_init();
+	if (r)
+		goto error_fini_kfd;
+
 	/* let modprobe override vga console setting */
-	return pci_register_driver(&amdgpu_kms_pci_driver);
+	r = pci_register_driver(&amdgpu_kms_pci_driver);
+	if (!r)
+		return 0;
+	amdgpu_sb_fini();
+error_fini_kfd:
+	amdgpu_amdkfd_fini();
 
 error_fini_sync:
 	amdgpu_sync_fini();
@@ -3411,6 +3495,7 @@ static void __exit amdgpu_exit(void)
 {
 	amdgpu_amdkfd_fini();
 	pci_unregister_driver(&amdgpu_kms_pci_driver);
+	amdgpu_sb_fini();
 	amdgpu_unregister_atpx_handler();
 	amdgpu_acpi_release();
 	amdgpu_sync_fini();

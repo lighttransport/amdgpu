@@ -24,6 +24,8 @@
  * consumed zero-copy via mmap).
  */
 
+#include "amdgpu_sandbox.h"
+
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
 #include <linux/compat.h>
@@ -80,6 +82,8 @@ static void kfd_dlog_gtt_unreserve(u64 bytes)
 }
 
 struct kfd_dlog_stream {
+	/* Independent of target: the stream can outlive process exit. */
+	struct amdgpu_sandbox *sandbox;
 	struct kfd_process	*target;
 	/*
 	 * RAW owning node, read only under @lock; NULLed at the last kref put.
@@ -195,9 +199,9 @@ static int kfd_dlog_stream_alloc_bo(struct kfd_dlog_stream *st)
 	if (!kfd_dlog_gtt_reserve(st->bo_size))
 		return -ENOMEM;
 
-	ret = amdgpu_amdkfd_alloc_kernel_mem(adev, st->bo_size,
+	ret = amdgpu_amdkfd_alloc_kernel_mem_owned(adev, st->bo_size,
 					     AMDGPU_GEM_DOMAIN_GTT, &mem_obj,
-					     &gpu_addr, &cpu_ptr, false, false);
+					     &gpu_addr, &cpu_ptr, false, false, st->sandbox);
 	if (ret) {
 		kfd_dlog_gtt_unreserve(st->bo_size);
 		return ret;
@@ -505,6 +509,7 @@ static void kfd_dlog_stream_destroy(struct kref *kref)
 	kfd_dlog_stream_free_finish(bo, unreserve, st->bo_size);
 
 	mutex_destroy(&st->lock);
+	amdgpu_sb_put(st->sandbox);
 	kfree(st);
 }
 
@@ -624,8 +629,10 @@ static long kfd_dlog_stream_ioctl(struct file *file, unsigned int cmd,
 {
 	struct kfd_dlog_stream *st = file->private_data;
 	struct kfd_dlog_stream_args args;
-	long ret = 0;
+	long ret = amdgpu_sb_check_current(st->sandbox, NULL);
 
+	if (ret)
+		return ret;
 	if (cmd != KFD_DLOG_STREAM_IOC)
 		return -ENOTTY;
 
@@ -731,6 +738,10 @@ static int kfd_dlog_stream_mmap(struct file *file, struct vm_area_struct *vma)
 	struct kfd_dlog_stream *st = file->private_data;
 	unsigned long size = vma->vm_end - vma->vm_start;
 	int ret;
+
+	ret = amdgpu_sb_check_current(st->sandbox, NULL);
+	if (ret)
+		return ret;
 
 	if (vma->vm_pgoff)
 		return -EINVAL;
@@ -863,6 +874,9 @@ static __poll_t kfd_dlog_stream_poll(struct file *file,
 	bool drain_pending_now = false;
 	bool has_records;
 	__poll_t mask = 0;
+
+	if (amdgpu_sb_check_current(st->sandbox, NULL))
+		return EPOLLERR | EPOLLHUP;
 
 	/* Register on the waitqueue before the level check (poll contract). */
 	poll_wait(file, &st->poll_wq, wait);
@@ -1027,6 +1041,9 @@ int kfd_dlog_stream_create_file(struct kfd_ioctl_dlog_args *args,
 		goto err_target;
 	}
 	node = pdd->dev;
+	ret = amdgpu_sb_check_current(target->sandbox, node->adev);
+	if (ret)
+		goto err_target;
 
 	/* Single arch gate: nonzero only for supported GC versions, no FW gating. */
 	num_regions = kfd_dispatch_log_node_num_regions(node);
@@ -1047,6 +1064,7 @@ int kfd_dlog_stream_create_file(struct kfd_ioctl_dlog_args *args,
 	}
 
 	st->target = target;
+	st->sandbox = amdgpu_sb_get(target->sandbox);
 	st->gpu_id = args->gpu_id;
 	/*
 	 * Report the target's TGID (group leader) in the CALLER's pid namespace,

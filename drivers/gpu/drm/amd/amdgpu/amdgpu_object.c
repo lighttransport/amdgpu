@@ -38,6 +38,7 @@
 #include <drm/amdgpu_drm.h>
 #include <drm/drm_cache.h>
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_vram_mgr.h"
@@ -58,10 +59,21 @@
  *
  */
 
+void amdgpu_bo_sandbox_release(struct amdgpu_bo *bo)
+{
+	amdgpu_sb_range_free(bo->sandbox_range);
+	amdgpu_sb_uncharge(bo->sandbox, AMDGPU_SB_BUFFER, bo->sandbox_bytes);
+	amdgpu_sb_uncharge(bo->sandbox, AMDGPU_SB_BOS, bo->sandbox ? 1 : 0);
+	amdgpu_sb_put(bo->sandbox);
+	bo->sandbox_range = NULL;
+	bo->sandbox = NULL;
+}
+
 static void amdgpu_bo_destroy(struct ttm_buffer_object *tbo)
 {
 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
 
+	amdgpu_bo_sandbox_release(bo);
 	amdgpu_bo_kunmap(bo);
 
 	if (drm_gem_is_imported(&bo->tbo.base))
@@ -221,29 +233,11 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 	placement->placement = places;
 }
 
-/**
- * amdgpu_bo_create_reserved - create reserved BO for kernel use
- *
- * @adev: amdgpu device object
- * @size: size for the new BO
- * @align: alignment for the new BO
- * @domain: where to place it
- * @bo_ptr: used to initialize BOs in structures
- * @gpu_addr: GPU addr of the pinned BO
- * @cpu_addr: optional CPU address mapping
- *
- * Allocates and pins a BO for kernel internal use, and returns it still
- * reserved.
- *
- * Note: For bo_ptr new BO is only created if bo_ptr points to NULL.
- *
- * Returns:
- * 0 on success, negative error code otherwise.
- */
-int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+static int amdgpu_bo_create_reserved_owned(struct amdgpu_device *adev,
 			      unsigned long size, int align,
 			      u32 domain, struct amdgpu_bo **bo_ptr,
-			      u64 *gpu_addr, void **cpu_addr)
+			      u64 *gpu_addr, void **cpu_addr,
+			      struct amdgpu_sandbox *sandbox)
 {
 	struct amdgpu_bo_param bp;
 	bool free = false;
@@ -254,7 +248,16 @@ int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
 		return 0;
 	}
 
+	if (sandbox) {
+		if (*bo_ptr && (*bo_ptr)->sandbox != sandbox)
+			return -EXDEV;
+		r = amdgpu_sb_check(sandbox);
+		if (r)
+			return r;
+	}
 	memset(&bp, 0, sizeof(bp));
+	bp.sandbox = sandbox;
+	bp.sandbox_explicit = true;
 	bp.size = size;
 	bp.byte_align = align;
 	bp.domain = domain;
@@ -322,6 +325,34 @@ error_free:
 }
 
 /**
+ * amdgpu_bo_create_reserved - create reserved BO for kernel use
+ *
+ * @adev: amdgpu device object
+ * @size: size for the new BO
+ * @align: alignment for the new BO
+ * @domain: where to place it
+ * @bo_ptr: used to initialize BOs in structures
+ * @gpu_addr: GPU addr of the pinned BO
+ * @cpu_addr: optional CPU address mapping
+ *
+ * Allocates and pins a BO for kernel internal use, and returns it still
+ * reserved.
+ *
+ * Note: For bo_ptr new BO is only created if bo_ptr points to NULL.
+ *
+ * Returns:
+ * 0 on success, negative error code otherwise.
+ */
+int amdgpu_bo_create_reserved(struct amdgpu_device *adev,
+			      unsigned long size, int align,
+			      u32 domain, struct amdgpu_bo **bo_ptr,
+			      u64 *gpu_addr, void **cpu_addr)
+{
+	return amdgpu_bo_create_reserved_owned(adev, size, align, domain, bo_ptr,
+					       gpu_addr, cpu_addr, NULL);
+}
+
+/**
  * amdgpu_bo_create_kernel - create BO for kernel use
  *
  * @adev: amdgpu device object
@@ -351,6 +382,27 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
 
 	r = amdgpu_bo_create_reserved(adev, size, align, domain, bo_ptr,
 				      gpu_addr, cpu_addr);
+
+	if (r)
+		return r;
+
+	if (*bo_ptr)
+		amdgpu_bo_unreserve(*bo_ptr);
+
+	return 0;
+}
+
+/* Explicit captured owner for per-client kernel BOs, including worker use. */
+int amdgpu_bo_create_kernel_owned(struct amdgpu_device *adev,
+			    unsigned long size, int align,
+			    u32 domain, struct amdgpu_bo **bo_ptr,
+			    u64 *gpu_addr, void **cpu_addr,
+			    struct amdgpu_sandbox *sandbox)
+{
+	int r;
+
+	r = amdgpu_bo_create_reserved_owned(adev, size, align, domain, bo_ptr,
+				      gpu_addr, cpu_addr, sandbox);
 
 	if (r)
 		return r;
@@ -671,6 +723,28 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 	bo = kvzalloc(bp->bo_ptr_size, GFP_KERNEL);
 	if (bo == NULL)
 		return -ENOMEM;
+	if (bp->sandbox || bp->sandbox_explicit)
+		bo->sandbox = amdgpu_sb_get(bp->sandbox);
+	else if (bp->type != ttm_bo_type_kernel)
+		bo->sandbox = amdgpu_sb_current(adev);
+	if (IS_ERR(bo->sandbox)) {
+		r = PTR_ERR(bo->sandbox);
+		kvfree(bo);
+		return r;
+	}
+	if (!amdgpu_sb_allows(bo->sandbox, adev)) {
+		r = -EXDEV;
+		goto sandbox_error;
+	}
+	r = amdgpu_sb_charge(bo->sandbox, AMDGPU_SB_BUFFER, size);
+	if (r)
+		goto sandbox_error;
+	r = amdgpu_sb_charge(bo->sandbox, AMDGPU_SB_BOS, 1);
+	if (r) {
+		amdgpu_sb_uncharge(bo->sandbox, AMDGPU_SB_BUFFER, size);
+		goto sandbox_error;
+	}
+	bo->sandbox_bytes = bo->sandbox ? size : 0;
 	drm_gem_private_object_init(adev_to_drm(adev), &bo->tbo.base, size);
 #ifndef HAVE_STRUCT_DRM_DRV_GEM_OPEN_OBJECT_CALLBACK
 	bo->tbo.base.funcs = &amdgpu_gem_object_funcs;
@@ -764,6 +838,11 @@ fail_unreserve:
 		dma_resv_unlock(amdkcl_ttm_resvp(&bo->tbo));
 	amdgpu_bo_unref(&bo);
 	return r;
+sandbox_error:
+	amdgpu_sb_put(bo->sandbox);
+	kvfree(bo);
+	return r;
+
 }
 
 /**

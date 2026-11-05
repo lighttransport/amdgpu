@@ -29,6 +29,7 @@
 #include <drm/drm_drv.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_vm.h"
 #include "amdgpu_userq.h"
@@ -147,6 +148,10 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 			info = &ti->task;
 		}
 	}
+
+	if (!queue->last_fence || !dma_fence_is_signaled(queue->last_fence))
+		amdgpu_sb_fault(queue->sandbox, queue->fence_drv->context,
+				queue->last_fence ? queue->last_fence->seqno : 0);
 
 	if (amdgpu_userq_is_reset_type_supported(adev, queue->queue_type,
 						 AMDGPU_RESET_TYPE_PER_QUEUE)) {
@@ -338,6 +343,10 @@ static int amdgpu_userq_restore_helper(struct amdgpu_usermode_queue *queue)
 		adev->userq_funcs[queue->queue_type];
 	int r = 0;
 
+	/* A quarantined queue remains quiesced without failing other clients' resume. */
+	if (amdgpu_sb_check(queue->sandbox))
+		return 0;
+
 	if (queue->state == AMDGPU_USERQ_STATE_PREEMPTED) {
 		trace_amdgpu_userq_state_start(queue);
 
@@ -387,6 +396,10 @@ static int amdgpu_userq_map_helper(struct amdgpu_usermode_queue *queue)
 	const struct amdgpu_userq_funcs *userq_funcs =
 		adev->userq_funcs[queue->queue_type];
 	int r;
+
+	/* A quarantined queue remains quiesced without failing other clients' resume. */
+	if (amdgpu_sb_check(queue->sandbox))
+		return 0;
 
 	if (queue->state == AMDGPU_USERQ_STATE_UNMAPPED) {
 		trace_amdgpu_userq_state_start(queue);
@@ -577,6 +590,8 @@ amdgpu_userq_destroy(struct amdgpu_userq_mgr *uq_mgr, struct amdgpu_usermode_que
 	amdgpu_bo_unref(&queue->db_obj.obj);
 
 	trace_amdgpu_userq_destroy_end(queue, r);
+	amdgpu_sb_uncharge(queue->sandbox, AMDGPU_SB_QUEUES, 1);
+	amdgpu_sb_put(queue->sandbox);
 	kfree(queue);
 
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -631,7 +646,7 @@ static int amdgpu_userq_priority_permit(struct drm_file *filp,
 }
 
 static int
-amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+amdgpu_userq_create_impl(struct drm_file *filp, union drm_amdgpu_userq *args)
 {
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
@@ -695,6 +710,10 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	queue->xcp_id = (fpriv->xcp_id != AMDGPU_XCP_NO_PARTITION) ?
 				fpriv->xcp_id : 0;
 	queue->userq_mgr = uq_mgr;
+	r = amdgpu_sb_charge(fpriv->sandbox, AMDGPU_SB_QUEUES, 1);
+	if (r)
+		goto free_queue;
+	queue->sandbox = amdgpu_sb_get(fpriv->sandbox);
 	INIT_DELAYED_WORK(&queue->hang_detect_work,
 			  amdgpu_userq_hang_detect_work);
 
@@ -806,10 +825,28 @@ free_fence_drv:
 	amdgpu_userq_fence_driver_free(queue);
 free_queue:
 	trace_amdgpu_userq_create_end(queue, r);
+	amdgpu_sb_uncharge(queue->sandbox, AMDGPU_SB_QUEUES, 1);
+	amdgpu_sb_put(queue->sandbox);
 	kfree(queue);
 err_pm_runtime:
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 	return r;
+}
+
+static int amdgpu_userq_create(struct drm_file *file, union drm_amdgpu_userq *args)
+{
+	struct amdgpu_fpriv *fpriv = file->driver_priv;
+	struct amdgpu_userq_mgr *mgr = &fpriv->userq_mgr;
+	int ret;
+
+	if (!fpriv->sandbox)
+		return amdgpu_userq_create_impl(file, args);
+	mutex_lock(&mgr->sandbox_mutex);
+	ret = amdgpu_sb_check_current(fpriv->sandbox, mgr->adev);
+	if (!ret)
+		ret = amdgpu_userq_create_impl(file, args);
+	mutex_unlock(&mgr->sandbox_mutex);
+	return ret;
 }
 
 static int amdgpu_userq_input_args_validate(struct drm_device *dev,
@@ -1318,6 +1355,56 @@ amdgpu_userq_wait_for_signal(struct amdgpu_userq_mgr *uq_mgr)
 	}
 }
 
+int amdgpu_userq_sandbox_quarantine(struct amdgpu_userq_mgr *uq_mgr)
+{
+	struct amdgpu_usermode_queue *queue;
+	unsigned long index = 0;
+	int ret = 0, r;
+
+	/* An in-flight constructor must publish or roll back before the scan.
+	 * Its failure path frees partial objects without running the queue dtor.
+	 */
+	mutex_lock(&uq_mgr->sandbox_mutex);
+	cancel_delayed_work_sync(&uq_mgr->resume_work);
+	for (;;) {
+		xa_lock(&uq_mgr->userq_xa);
+		for (;;) {
+			queue = xa_find(&uq_mgr->userq_xa, &index, ULONG_MAX, XA_PRESENT);
+			if (!queue || kref_get_unless_zero(&queue->refcount))
+				break;
+			/* A concurrent final put may precede xarray removal. */
+			if (index == ULONG_MAX) {
+				queue = NULL;
+				break;
+			}
+			index++;
+		}
+		xa_unlock(&uq_mgr->userq_xa);
+		if (!queue)
+			break;
+		if (!down_read_trylock(&uq_mgr->adev->reset_domain->sem)) {
+			amdgpu_userq_put(queue);
+			ret = -EAGAIN;
+			break;
+		}
+		mutex_lock(&uq_mgr->userq_mutex);
+		r = amdgpu_userq_unmap_helper(queue);
+		if (!r)
+			amdgpu_userq_fence_driver_force_completion(queue);
+		mutex_unlock(&uq_mgr->userq_mutex);
+		up_read(&uq_mgr->adev->reset_domain->sem);
+		/* Final put may destroy the queue and reacquire its reset domain. */
+		amdgpu_userq_put(queue);
+		if (r)
+			ret = r;
+		if (index == ULONG_MAX)
+			break;
+		index++;
+	}
+	mutex_unlock(&uq_mgr->sandbox_mutex);
+	return ret;
+}
+
 void
 amdgpu_userq_evict(struct amdgpu_userq_mgr *uq_mgr)
 {
@@ -1329,6 +1416,7 @@ amdgpu_userq_evict(struct amdgpu_userq_mgr *uq_mgr)
 int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct drm_file *file_priv,
 			  struct amdgpu_device *adev)
 {
+	mutex_init(&userq_mgr->sandbox_mutex);
 	mutex_init(&userq_mgr->userq_mutex);
 	xa_init_flags(&userq_mgr->userq_xa, XA_FLAGS_ALLOC);
 	userq_mgr->adev = adev;
@@ -1399,6 +1487,7 @@ void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr)
 
 	mutex_destroy(&userq_mgr->proc_ctx_lock);
 	mutex_destroy(&userq_mgr->userq_mutex);
+	mutex_destroy(&userq_mgr->sandbox_mutex);
 }
 
 int amdgpu_userq_suspend(struct amdgpu_device *adev)
@@ -1577,6 +1666,8 @@ int amdgpu_userq_post_reset(struct amdgpu_device *adev, bool vram_lost)
 	int ret = 0, r;
 
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
+		if (amdgpu_sb_check(queue->sandbox))
+			continue;
 		if (queue->state == AMDGPU_USERQ_STATE_HUNG && !vram_lost) {
 			trace_amdgpu_userq_state_start(queue);
 

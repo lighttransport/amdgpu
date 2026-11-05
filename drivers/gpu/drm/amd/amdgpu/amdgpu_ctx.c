@@ -25,6 +25,7 @@
 #include <drm/drm_auth.h>
 #include <drm/drm_drv.h>
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_sched.h"
 #include "amdgpu_ras.h"
 #include <linux/nospec.h>
@@ -325,6 +326,10 @@ static int amdgpu_ctx_init(struct amdgpu_ctx_mgr *mgr, int32_t priority,
 		return r;
 
 	memset(ctx, 0, sizeof(*ctx));
+	r = amdgpu_sb_charge(fpriv->sandbox, AMDGPU_SB_CONTEXTS, 1);
+	if (r)
+		return r;
+	ctx->sandbox = amdgpu_sb_get(fpriv->sandbox);
 
 	kref_init(&ctx->refcount);
 	ctx->mgr = mgr;
@@ -437,6 +442,8 @@ void amdgpu_ctx_fini(struct kref *ref)
 		drm_dev_exit(idx);
 	}
 
+	amdgpu_sb_uncharge(ctx->sandbox, AMDGPU_SB_CONTEXTS, 1);
+	amdgpu_sb_put(ctx->sandbox);
 	kfree(ctx);
 }
 

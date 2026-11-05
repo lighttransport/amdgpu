@@ -416,7 +416,12 @@ struct amdgpu_flip_work {
  * file private structure
  */
 
+struct amdgpu_sandbox;
+struct amdgpu_sb_client;
+
 struct amdgpu_fpriv {
+	struct amdgpu_sandbox *sandbox;
+	struct amdgpu_sb_client *sandbox_client;
 	struct amdgpu_vm	vm;
 	struct amdgpu_bo_va	*prt_va;
 	struct amdgpu_bo_va	*csa_va;

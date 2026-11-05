@@ -42,6 +42,7 @@
 #include <drm/drm_syncobj.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_display.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_hmm.h"
@@ -182,11 +183,12 @@ static void amdgpu_gem_object_free(struct drm_gem_object *gobj)
 	ttm_bo_fini(&aobj->tbo);
 }
 
-int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+static int amdgpu_gem_object_create_internal(struct amdgpu_device *adev, unsigned long size,
 			     int alignment, u32 initial_domain,
 			     u64 flags, enum ttm_bo_type type,
 			     struct dma_resv *resv,
-			     struct drm_gem_object **obj, int8_t xcp_id_plus1)
+			     struct drm_gem_object **obj, int8_t xcp_id_plus1,
+			     struct amdgpu_sandbox *sandbox, bool explicit)
 {
 	struct amdgpu_bo *bo;
 	struct amdgpu_bo_user *ubo;
@@ -197,6 +199,8 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 	*obj = NULL;
 	flags |= AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE;
 
+	bp.sandbox = sandbox;
+	bp.sandbox_explicit = explicit;
 	bp.size = size;
 	bp.byte_align = alignment;
 	bp.type = type;
@@ -215,6 +219,27 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 	*obj = &bo->tbo.base;
 
 	return 0;
+}
+
+int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
+			     int alignment, u32 initial_domain,
+			     u64 flags, enum ttm_bo_type type,
+			     struct dma_resv *resv,
+			     struct drm_gem_object **obj, int8_t xcp_id_plus1)
+{
+	return amdgpu_gem_object_create_internal(adev, size, alignment,
+		initial_domain, flags, type, resv, obj, xcp_id_plus1, NULL, false);
+}
+
+int amdgpu_gem_object_create_owned(struct amdgpu_device *adev, unsigned long size,
+			     int alignment, u32 initial_domain,
+			     u64 flags, enum ttm_bo_type type,
+			     struct dma_resv *resv,
+			     struct drm_gem_object **obj, int8_t xcp_id_plus1,
+			     struct amdgpu_sandbox *sandbox)
+{
+	return amdgpu_gem_object_create_internal(adev, size, alignment,
+		initial_domain, flags, type, resv, obj, xcp_id_plus1, sandbox, true);
 }
 
 void amdgpu_gem_force_release(struct amdgpu_device *adev)
@@ -241,6 +266,12 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
 	mutex_unlock(&ddev->filelist_mutex);
 }
 
+#ifdef HAVE_STRUCT_DRM_DRV_GEM_OPEN_OBJECT_CALLBACK
+void amdgpu_gem_object_close(struct drm_gem_object *obj, struct drm_file *file_priv);
+#else
+static void amdgpu_gem_object_close(struct drm_gem_object *obj, struct drm_file *file_priv);
+#endif
+
 /*
  * Call from drm_gem_handle_create which appear in both new and open ioctl
  * case.
@@ -261,6 +292,19 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 	struct mm_struct *mm;
 	struct drm_exec exec;
 	int r;
+
+	/* User GEM handle paths must preserve the captured BO/file owner.
+	 * KFD's shared kernel-only client indexes BOs for all processes; it is
+	 * never exposed as a userspace fd. KFD's import/IPC paths separately
+	 * validate the BO against the destination process, not the shared client.
+	 * Do not infer file ownership from a worker's current task.
+	 */
+	if (file_priv != adev->kfd.client.file &&
+	    abo->sandbox != fpriv->sandbox)
+		return -EXDEV;
+	r = amdgpu_sb_check(abo->sandbox);
+	if (r)
+		return r;
 
 	mm = amdgpu_ttm_tt_get_usermm(abo->tbo.ttm);
 	if (mm && mm != current->mm)
@@ -287,9 +331,15 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 	bo_va = amdgpu_vm_bo_find(vm, abo);
 	if (!bo_va) {
 		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
-		r = amdgpu_evf_mgr_attach_fence(&fpriv->evf_mgr, abo);
-		if (r)
+		if (!bo_va) {
+			r = -ENOMEM;
 			goto out_unlock;
+		}
+		r = amdgpu_evf_mgr_attach_fence(&fpriv->evf_mgr, abo);
+		if (r) {
+			amdgpu_vm_bo_del(adev, bo_va);
+			goto out_unlock;
+		}
 	} else {
 		++bo_va->ref_count;
 	}
@@ -327,6 +377,11 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 		}
 	}
 	mutex_unlock(&vm->process_info->lock);
+	/* Core does not call ->close when ->open fails. Undo this handle's
+	 * BO-VA reference after dropping the process-info lock.
+	 */
+	if (r)
+		amdgpu_gem_object_close(obj, file_priv);
 	return r;
 
 out_unlock:
@@ -365,12 +420,13 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 			goto out_unlock;
 	}
 
-	if (!amdgpu_vm_is_bo_always_valid(vm, bo))
-		amdgpu_evf_mgr_detach_fence(&fpriv->evf_mgr, bo);
-
 	bo_va = amdgpu_vm_bo_find(vm, bo);
 	if (!bo_va || --bo_va->ref_count)
 		goto out_unlock;
+
+	/* Open attaches once per BO-VA, not once per alias handle. */
+	if (!amdgpu_vm_is_bo_always_valid(vm, bo))
+		amdgpu_evf_mgr_detach_fence(&fpriv->evf_mgr, bo);
 
 	amdgpu_vm_bo_del(adev, bo_va);
 	amdgpu_vm_bo_update_shared(bo);
@@ -597,6 +653,13 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 	bo->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
 	bo->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
 	bo->parent = amdgpu_bo_ref(fpriv->vm.root.bo);
+	bo->sandbox_range = amdgpu_sb_range_add(bo->sandbox, current->mm,
+					      args->addr, args->size);
+	if (IS_ERR(bo->sandbox_range)) {
+		r = PTR_ERR(bo->sandbox_range);
+		bo->sandbox_range = NULL;
+		goto release_object;
+	}
 	r = amdgpu_ttm_tt_set_userptr(&bo->tbo, args->addr, args->flags);
 	if (r)
 		goto release_object;

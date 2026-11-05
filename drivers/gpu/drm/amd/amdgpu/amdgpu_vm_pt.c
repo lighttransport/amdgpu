@@ -438,15 +438,19 @@ exit:
  * @immediate: use a immediate update
  * @vmbo: pointer to the buffer object pointer
  * @xcp_id: GPU partition id
+ * @sandbox: policy owner held by the file or root page directory
  */
 int amdgpu_vm_pt_create(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 			int level, bool immediate, struct amdgpu_bo_vm **vmbo,
-			int32_t xcp_id)
+			int32_t xcp_id, struct amdgpu_sandbox *sandbox)
 {
 	struct amdgpu_bo_param bp;
 	unsigned int num_entries;
 
 	memset(&bp, 0, sizeof(bp));
+	/* Per-client page tables remain owned even when created by a worker. */
+	bp.sandbox = sandbox;
+	bp.sandbox_explicit = true;
 
 	bp.size = amdgpu_vm_pt_size(adev, level);
 	bp.byte_align = AMDGPU_GPU_PAGE_SIZE;
@@ -509,7 +513,7 @@ static int amdgpu_vm_pt_alloc(struct amdgpu_device *adev,
 
 	amdgpu_vm_eviction_unlock(vm);
 	r = amdgpu_vm_pt_create(adev, vm, cursor->level, immediate, &pt,
-				vm->root.bo->xcp_id);
+				vm->root.bo->xcp_id, vm->root.bo->sandbox);
 	amdgpu_vm_eviction_lock(vm);
 	if (r)
 		return r;

@@ -35,6 +35,7 @@
 #include "amdgpu_xgmi.h"
 #include "amdgpu_reset.h"
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_svm.h"
 #include "kfd_migrate.h"
 #include "kfd_smi_events.h"
@@ -320,6 +321,7 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 
 	mutex_destroy(&prange->lock);
 	mutex_destroy(&prange->migrate_mutex);
+	amdgpu_sb_range_free(prange->sandbox_range);
 	kfree(prange);
 }
 
@@ -343,6 +345,10 @@ svm_range *svm_range_new(struct svm_range_list *svms, uint64_t start,
 	struct svm_range *prange;
 	struct kfd_process *p;
 
+	/* The byte ledger uses an exclusive end; reject shifts/end wrapping. */
+	if (last < start || last >= (U64_MAX >> PAGE_SHIFT))
+		return NULL;
+
 	prange = kzalloc_obj(*prange);
 	if (!prange)
 		return NULL;
@@ -352,6 +358,15 @@ svm_range *svm_range_new(struct svm_range_list *svms, uint64_t start,
 	    amdgpu_amdkfd_reserve_mem_limit(NULL, size << PAGE_SHIFT,
 				    KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, 0)) {
 		pr_info("SVM mapping failed, exceeds resident system memory limit\n");
+		kfree(prange);
+		return NULL;
+	}
+	prange->sandbox_range = amdgpu_sb_range_add(p->sandbox, p->mm,
+						 start << PAGE_SHIFT, size << PAGE_SHIFT);
+	if (IS_ERR(prange->sandbox_range)) {
+		if (!p->xnack_enabled && update_mem_usage)
+			amdgpu_amdkfd_unreserve_mem_limit(NULL, size << PAGE_SHIFT,
+					KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, 0);
 		kfree(prange);
 		return NULL;
 	}
@@ -544,6 +559,7 @@ void svm_range_bo_destroy(struct ttm_buffer_object *tbo)
 	struct amdgpu_bo *bo = ttm_to_amdgpu_bo(tbo);
 	struct svm_range_bo *svm_bo = to_svm_range_bo(bo);
 
+	amdgpu_bo_sandbox_release(bo);
 	drm_gem_object_release(&bo->tbo.base);
 	/*
 	 * svm_bo->mm is only set once the BO is fully created. If
@@ -582,6 +598,8 @@ svm_range_vram_node_new(struct kfd_node *node, struct svm_range *prange,
 	}
 
 	memset(&bp, 0, sizeof(bp));
+	bp.sandbox = p->sandbox;
+	bp.sandbox_explicit = true;
 	bp.size = prange->npages * PAGE_SIZE;
 	bp.bo_ptr_size = sizeof(struct svm_range_bo);
 	bp.destroy = svm_range_bo_destroy;
@@ -1108,6 +1126,8 @@ svm_range_split_adjust(struct svm_range *new, struct svm_range *old,
 	old->npages = last - start + 1;
 	old->start = start;
 	old->last = last;
+	amdgpu_sb_range_shrink(old->sandbox_range, start << PAGE_SHIFT,
+				   (last - start + 1) << PAGE_SHIFT);
 	new->flags = old->flags;
 	new->preferred_loc = old->preferred_loc;
 	new->prefetch_loc = old->prefetch_loc;

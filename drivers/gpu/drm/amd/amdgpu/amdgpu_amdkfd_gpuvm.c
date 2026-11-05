@@ -31,6 +31,7 @@
 #include <drm/drm_exec.h>
 
 #include "amdgpu_object.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_gem.h"
 #include "amdgpu_vm.h"
 #include "amdgpu_hmm.h"
@@ -345,15 +346,16 @@ create_dmamap_sg_bo(struct amdgpu_device *adev,
 		flags |= mem->bo->flags & (AMDGPU_GEM_CREATE_COHERENT |
 					AMDGPU_GEM_CREATE_UNCACHED);
 
-	ret = amdgpu_gem_object_create(adev, mem->bo->tbo.base.size, 1,
+	ret = amdgpu_gem_object_create_owned(adev, mem->bo->tbo.base.size, 1,
 			AMDGPU_GEM_DOMAIN_CPU, AMDGPU_GEM_CREATE_PREEMPTIBLE | flags,
-			ttm_bo_type_sg, amdkcl_ttm_resvp(&mem->bo->tbo), &gem_obj, 0);
+			ttm_bo_type_sg, amdkcl_ttm_resvp(&mem->bo->tbo),
+			&gem_obj, 0, mem->bo->sandbox);
 
 	amdgpu_bo_unreserve(mem->bo);
 
 	if (ret) {
 		pr_err("Error in creating DMA mappable SG BO on domain: %d\n", ret);
-		return -EINVAL;
+		return ret;
 	}
 
 	*bo_out = gem_to_amdgpu_bo(gem_obj);
@@ -1916,8 +1918,8 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 		 va, (*mem)->aql_queue ? size << 1 : size,
 		 domain_string(alloc_domain), xcp_id);
 
-	ret = amdgpu_gem_object_create(adev, aligned_size, 1, alloc_domain, alloc_flags,
-				       bo_type, NULL, &gobj, xcp_id + 1);
+	ret = amdgpu_gem_object_create_owned(adev, aligned_size, 1, alloc_domain, alloc_flags,
+				       bo_type, NULL, &gobj, xcp_id + 1, fpriv->sandbox);
 	if (ret) {
 		pr_debug("Failed to create BO on domain %s. ret %d\n",
 			 domain_string(alloc_domain), ret);
@@ -1950,6 +1952,13 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 
 	if (user_addr) {
 		pr_debug("creating userptr BO for user_addr = %llx\n", user_addr);
+		bo->sandbox_range = amdgpu_sb_range_add(bo->sandbox, current->mm,
+						      user_addr, aligned_size);
+		if (IS_ERR(bo->sandbox_range)) {
+			ret = PTR_ERR(bo->sandbox_range);
+			bo->sandbox_range = NULL;
+			goto allocate_init_user_pages_failed;
+		}
 		ret = init_user_pages(*mem, user_addr, criu_resume);
 		if (ret)
 			goto allocate_init_user_pages_failed;
@@ -2004,6 +2013,15 @@ err:
 		kfree(sg);
 	}
 	return ret;
+}
+
+static void kfd_mem_sandbox_import_release(struct kgd_mem *mem)
+{
+	if (!mem->sandbox_import_charged)
+		return;
+	/* The caller still owns the BO reference until final GEM put. */
+	amdgpu_sb_uncharge(mem->bo->sandbox, AMDGPU_SB_BOS, 1);
+	mem->sandbox_import_charged = false;
 }
 
 int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
@@ -2109,6 +2127,8 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
 
 	/* Unreference the ipc_obj if applicable */
 	kfd_ipc_obj_put(&mem->ipc_obj);
+
+	kfd_mem_sandbox_import_release(mem);
 
 	/* Free the BO*/
 	drm_vma_node_revoke(&mem->bo->tbo.base.vma_node, drm_priv);
@@ -2679,6 +2699,13 @@ static int import_obj_create(struct amdgpu_device *adev,
 	int ret;
 
 	bo = gem_to_amdgpu_bo(obj);
+	/* Validate the destination independently of PRIME/global handle bookkeeping. */
+	if (bo->sandbox != container_of(avm, struct amdgpu_fpriv, vm)->sandbox)
+		return -EXDEV;
+	ret = amdgpu_sb_check_current(bo->sandbox, adev);
+	if (ret)
+		return ret;
+
 	if (!(bo->preferred_domains & (AMDGPU_GEM_DOMAIN_VRAM |
 				    AMDGPU_GEM_DOMAIN_GTT)))
 		/* Only VRAM and GTT BOs are supported */
@@ -2687,6 +2714,12 @@ static int import_obj_create(struct amdgpu_device *adev,
 	*mem = kzalloc_obj(struct kgd_mem);
 	if (!*mem)
 		return -ENOMEM;
+	(*mem)->bo = bo;
+	/* Bound repeated imports/cache aliases even when no new BO is created. */
+	ret = amdgpu_sb_charge(bo->sandbox, AMDGPU_SB_BOS, 1);
+	if (ret)
+		goto err_free_mem;
+	(*mem)->sandbox_import_charged = bo->sandbox != NULL;
 
 	ret = drm_vma_node_allow(&obj->vma_node, drm_priv);
 	if (ret)
@@ -2711,7 +2744,6 @@ static int import_obj_create(struct amdgpu_device *adev,
 
 	get_dma_buf(dma_buf);
 	(*mem)->dmabuf = dma_buf;
-	(*mem)->bo = bo;
 	(*mem)->va = va;
 	(*mem)->domain = (bo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM) &&
 			 !adev->apu_prefer_gtt ?
@@ -2736,9 +2768,14 @@ static int import_obj_create(struct amdgpu_device *adev,
 
 err_remove_mem:
 	remove_kgd_mem_from_kfd_bo_list(*mem, avm->process_info);
+	amdgpu_sync_free(&(*mem)->sync);
+	dma_buf_put((*mem)->dmabuf);
+	mutex_destroy(&(*mem)->lock);
 	drm_vma_node_revoke(&obj->vma_node, drm_priv);
 err_free_mem:
+	kfd_mem_sandbox_import_release(*mem);
 	kfree(*mem);
+	*mem = NULL;
 	return ret;
 }
 
@@ -2778,33 +2815,40 @@ int amdgpu_amdkfd_gpuvm_import_dmabuf_fd(struct amdgpu_device *adev, int fd,
 					 struct kgd_mem **mem, uint64_t *size,
 					 uint64_t *mmap_offset)
 {
+	struct dma_buf *dmabuf;
 	struct drm_gem_object *obj;
 	uint32_t handle;
 	int ret;
 
-	ret = drm_gem_prime_fd_to_handle(&adev->ddev, adev->kfd.client.file, fd,
-					 &handle);
-	if (ret)
-		return ret;
-	obj = drm_gem_object_lookup(adev->kfd.client.file, handle);
-	if (!obj) {
-		ret = -EINVAL;
-		goto err_release_handle;
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+	obj = amdgpu_gem_prime_import(&adev->ddev, dmabuf);
+	if (IS_ERR(obj)) {
+		ret = PTR_ERR(obj);
+		goto err_put_dmabuf;
 	}
-
-	ret = import_obj_create(adev, obj->dma_buf, obj, va, drm_priv, mem, size,
-				mmap_offset);
+	/* Each kgd_mem owns a distinct kernel-client handle. The PRIME fd
+	 * cache returns a borrowed shared handle; deleting that on failed
+	 * import or release would invalidate another live import's handle.
+	 */
+	ret = drm_gem_handle_create(adev->kfd.client.file, obj, &handle);
 	if (ret)
 		goto err_put_obj;
-
+	ret = import_obj_create(adev, dmabuf, obj, va, drm_priv, mem, size,
+				mmap_offset);
+	if (ret)
+		goto err_release_handle;
 	(*mem)->gem_handle = handle;
-
+	dma_buf_put(dmabuf);
 	return 0;
 
-err_put_obj:
-	drm_gem_object_put(obj);
 err_release_handle:
 	drm_gem_handle_delete(adev->kfd.client.file, handle);
+err_put_obj:
+	drm_gem_object_put(obj);
+err_put_dmabuf:
+	dma_buf_put(dmabuf);
 	return ret;
 }
 

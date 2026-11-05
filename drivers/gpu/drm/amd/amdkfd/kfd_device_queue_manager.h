@@ -263,6 +263,7 @@ struct device_queue_manager {
 	uint64_t		pipelines_addr;
 	uint64_t		fence_gpu_addr;
 	uint64_t		*fence_addr;
+	u64			sandbox_fence_seq;
 	struct kfd_mem_obj	*fence_mem;
 	bool			active_runlist;
 	int			sched_policy;
@@ -363,6 +364,13 @@ static inline void dqm_lock(struct device_queue_manager *dqm)
 {
 	mutex_lock(&dqm->lock_hidden);
 	dqm->saved_flags = memalloc_noreclaim_save();
+}
+static inline bool dqm_trylock(struct device_queue_manager *dqm)
+{
+	if (!mutex_trylock(&dqm->lock_hidden))
+		return false;
+	dqm->saved_flags = memalloc_noreclaim_save();
+	return true;
 }
 static inline void dqm_unlock(struct device_queue_manager *dqm)
 {

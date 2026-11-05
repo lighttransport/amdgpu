@@ -590,7 +590,11 @@ enum KFD_QUEUE_PRIORITY {
  *
  */
 
+struct amdgpu_sandbox;
+
 struct queue_properties {
+	/* Borrowed from the process/queue for private MQD allocations. */
+	struct amdgpu_sandbox *sandbox;
 	enum kfd_queue_type type;
 	enum kfd_queue_format format;
 	unsigned int queue_id;
@@ -703,7 +707,12 @@ struct mqd_update_info {
  *
  */
 
+struct amdgpu_sandbox;
+struct amdgpu_sb_client;
+
 struct queue {
+	struct amdgpu_sandbox *sandbox;
+	u64 sandbox_context;
 	struct list_head list;
 	void *mqd;
 	struct kfd_mem_obj *mqd_mem_obj;
@@ -1089,6 +1098,8 @@ struct kfd_dlog_session {
 
 /* Process data */
 struct kfd_process {
+	struct amdgpu_sandbox *sandbox;
+	struct amdgpu_sb_client *sandbox_client;
 	/*
 	 * kfd_process are stored in an mm_struct*->kfd_process*
 	 * hash table (kfd_processes in kfd_process.c)
@@ -1619,6 +1630,7 @@ struct kernel_queue *kernel_queue_init(struct kfd_node *dev,
 					enum kfd_queue_type type);
 void kernel_queue_uninit(struct kernel_queue *kq);
 int kfd_evict_process_device(struct kfd_process_device *pdd);
+int kfd_sandbox_evict_process_device(struct kfd_process_device *pdd);
 int kfd_dqm_suspend_bad_queue_mes(struct kfd_node *knode, u32 pasid, u32 doorbell_id);
 
 /* Process Queue Manager */

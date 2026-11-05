@@ -23,6 +23,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/dma-fence.h>
 #include <linux/list.h>
 #include <linux/cred.h>		/* current_cred, __task_cred, uid_eq, gid_eq */
 #include <linux/capability.h>	/* perfmon_capable, ns_capable, CAP_SYS_PTRACE */
@@ -32,6 +33,7 @@
 #include <linux/sched/coredump.h>	/* get_dumpable, SUID_DUMP_USER */
 #include "kfd_device_queue_manager.h"
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_kernel_queue.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_object.h"	/* amdgpu_bo */
@@ -265,27 +267,35 @@ static int init_user_queue(struct process_queue_manager *pqm,
 	/* let DQM handle it*/
 	q_properties->vmid = 0;
 	q_properties->queue_id = qid;
+	q_properties->sandbox = pqm->process->sandbox;
 
 	retval = init_queue(q, q_properties);
 	if (retval != 0)
 		return retval;
 
+	retval = amdgpu_sb_charge(pqm->process->sandbox, AMDGPU_SB_QUEUES, 1);
+	if (retval)
+		goto cleanup;
+	(*q)->sandbox = amdgpu_sb_get(pqm->process->sandbox);
+	if ((*q)->sandbox)
+		(*q)->sandbox_context = dma_fence_context_alloc(1);
 	(*q)->device = dev;
 	(*q)->process = pqm->process;
 
 	if (dev->kfd->shared_resources.enable_mes) {
 		if (!q_properties->wptr_bo) {
 			pr_debug("Queue initialization with shared MES requires queue buffers to be initialized\n");
-			return -EINVAL;
+			retval = -EINVAL;
+			goto cleanup;
 		}
 
-		retval = amdgpu_amdkfd_alloc_kernel_mem(dev->adev,
+		retval = amdgpu_amdkfd_alloc_kernel_mem_owned(dev->adev,
 						AMDGPU_MES_GANG_CTX_SIZE,
 						AMDGPU_GEM_DOMAIN_GTT,
 						&(*q)->gang_ctx_bo,
 						&(*q)->gang_ctx_gpu_addr,
 						&(*q)->gang_ctx_cpu_ptr,
-						false, true);
+						false, true, pqm->process->sandbox);
 		if (retval) {
 			pr_err("failed to allocate gang context bo\n");
 			goto cleanup;
@@ -297,7 +307,7 @@ static int init_user_queue(struct process_queue_manager *pqm,
 						&(*q)->gang_ctx_array_index);
 			if (retval) {
 				pr_err("failed to allocate gang context index slot\n");
-				goto cleanup;
+				goto free_gang_ctx_bo_only;
 			}
 		}
 		/* Starting with GFX11, wptr BOs must be mapped to GART for MES to determine work
@@ -322,6 +332,7 @@ static int init_user_queue(struct process_queue_manager *pqm,
 
 free_gang_ctx_bo:
 	amdgpu_mes_free_gang_ctx_index(&dev->adev->mes, (*q)->gang_ctx_array_index);
+free_gang_ctx_bo_only:
 	amdgpu_amdkfd_free_kernel_mem(dev->adev, &(*q)->gang_ctx_bo);
 cleanup:
 	uninit_queue(*q);
@@ -485,13 +496,13 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 
 	/* Allocate proc_ctx_bo only if MES is enabled and this is the first queue */
 	if (!pdd->proc_ctx_cpu_ptr && dev->kfd->shared_resources.enable_mes) {
-		retval = amdgpu_amdkfd_alloc_kernel_mem(dev->adev,
+		retval = amdgpu_amdkfd_alloc_kernel_mem_owned(dev->adev,
 						     AMDGPU_MES_PROC_CTX_SIZE,
 						     AMDGPU_GEM_DOMAIN_GTT,
 						     &pdd->proc_ctx_bo,
 						     &pdd->proc_ctx_gpu_addr,
 						     &pdd->proc_ctx_cpu_ptr,
-						     false, true);
+						     false, true, pqm->process->sandbox);
 		if (retval) {
 			dev_err(dev->adev->dev, "failed to allocate process context bo\n");
 			goto err_allocate_pqn;

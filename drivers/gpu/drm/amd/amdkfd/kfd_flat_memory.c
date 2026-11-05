@@ -32,6 +32,7 @@
 #include <uapi/linux/kfd_ioctl.h>
 #include <linux/time.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/processor.h>
@@ -386,7 +387,8 @@ int kfd_init_apertures(struct kfd_process *process)
 
 	/*Iterating over all devices*/
 	while (kfd_topology_enum_kfd_devices(id, &dev) == 0) {
-		if (!dev || kfd_devcgroup_check_permission(dev)) {
+		if (!dev || kfd_devcgroup_check_permission(dev) ||
+		    !amdgpu_sb_allows(process->sandbox, dev->adev)) {
 			/* Skip non GPU devices and devices to which the
 			 * current process have no access to. Access can be
 			 * limited by placing the process in a specific

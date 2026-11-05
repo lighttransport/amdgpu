@@ -28,6 +28,7 @@
 #include <drm/drm_drv.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_dev_coredump.h"
@@ -153,6 +154,10 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 		amdgpu_vm_print_task_info(adev, ti);
 		info = &ti->task;
 	}
+
+	/* The false-timeout checks above must not count as tenant faults. */
+	amdgpu_sb_fault(job->sandbox, s_job->s_fence->finished.context,
+			s_job->s_fence->finished.seqno);
 
 	/* attempt a per ring reset */
 	if (amdgpu_gpu_recovery &&
@@ -402,6 +407,8 @@ static void amdgpu_job_free_cb(struct drm_sched_job *s_job)
 	else
 		kfree(job->hw_vm_fence);
 
+	amdgpu_sb_uncharge(job->sandbox, AMDGPU_SB_JOBS, 1);
+	amdgpu_sb_put(job->sandbox);
 	kfree(job);
 }
 
@@ -440,6 +447,8 @@ void amdgpu_job_free(struct amdgpu_job *job)
 	else
 		kfree(job->hw_vm_fence);
 
+	amdgpu_sb_uncharge(job->sandbox, AMDGPU_SB_JOBS, 1);
+	amdgpu_sb_put(job->sandbox);
 	kfree(job);
 }
 
@@ -523,6 +532,8 @@ static struct dma_fence *amdgpu_job_run(struct drm_sched_job *sched_job)
 	finished = &job->base.s_fence->finished;
 
 	trace_amdgpu_sched_run_job(job);
+	if (amdgpu_sb_check(job->sandbox))
+		dma_fence_set_error(finished, -ECANCELED);
 
 	/* Skip job if VRAM is lost and never resubmit gangs */
 	if (job->generation != amdgpu_vm_generation(adev, job->vm) ||

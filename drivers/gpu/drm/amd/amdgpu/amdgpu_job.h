@@ -64,7 +64,10 @@ enum amdgpu_ib_pool_type;
 #define AMDGPU_KERNEL_JOB_ID_VPE_RING_TEST          (18446744073709551599ULL)
 #define AMDGPU_KERNEL_JOB_ID_RUN_SHADER             (18446744073709551598ULL)
 
+struct amdgpu_sandbox;
+
 struct amdgpu_job {
+	struct amdgpu_sandbox *sandbox;
 	struct drm_sched_job    base;
 	struct amdgpu_vm	*vm;
 	struct amdgpu_sync	explicit_sync;

@@ -45,7 +45,15 @@
 #define to_amdgpu_bo_user(abo) container_of((abo), struct amdgpu_bo_user, bo)
 #define to_amdgpu_bo_vm(abo) container_of((abo), struct amdgpu_bo_vm, bo)
 
+struct amdgpu_sandbox;
+struct amdgpu_sb_range;
+
+void amdgpu_bo_sandbox_release(struct amdgpu_bo *bo);
+
 struct amdgpu_bo_param {
+	struct amdgpu_sandbox *sandbox;
+	/* Preserve a captured NULL owner instead of inferring current. */
+	bool sandbox_explicit;
 	unsigned long			size;
 	int				byte_align;
 	u32				bo_ptr_size;
@@ -101,6 +109,9 @@ struct amdgpu_bo_va {
 };
 
 struct amdgpu_bo {
+	struct amdgpu_sb_range *sandbox_range;
+	struct amdgpu_sandbox *sandbox;
+	u64 sandbox_bytes;
 	/* Protected by tbo.reserved */
 	u32				preferred_domains;
 	u32				allowed_domains;
@@ -270,6 +281,11 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
 			    unsigned long size, int align,
 			    u32 domain, struct amdgpu_bo **bo_ptr,
 			    u64 *gpu_addr, void **cpu_addr);
+int amdgpu_bo_create_kernel_owned(struct amdgpu_device *adev,
+			    unsigned long size, int align,
+			    u32 domain, struct amdgpu_bo **bo_ptr,
+			    u64 *gpu_addr, void **cpu_addr,
+			    struct amdgpu_sandbox *sandbox);
 int amdgpu_bo_create_isp_user(struct amdgpu_device *adev,
 			   struct dma_buf *dbuf, u32 domain,
 			   struct amdgpu_bo **bo,

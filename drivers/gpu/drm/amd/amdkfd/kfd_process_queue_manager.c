@@ -697,6 +697,13 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 			pr_err("Pasid 0x%x destroy queue %d failed, ret %d\n",
 				pdd->pasid,
 				pqn->q->properties.queue_id, retval);
+			/* A failed MES removal leaves the DQM queue linked and its
+			 * resources live. Do not free its PQM owner on a tolerated
+			 * timeout when the DQM aborted destruction.
+			 */
+			if (dev->kfd->shared_resources.enable_mes &&
+			    !pqn->q->properties.is_being_destroyed)
+				goto err_destroy_queue;
 			if (retval != -ETIME && retval != -EIO)
 				goto err_destroy_queue;
 		}

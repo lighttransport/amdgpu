@@ -350,6 +350,14 @@ static int remove_queue_mes_on_reset_option(struct device_queue_manager *dqm, st
 		return r;
 
 	/* remove_hw_queue failure indicates a queue hang. reset the queue */
+	{
+		struct kfd_process_device *pdd = qpd_to_pdd(qpd);
+
+		dev_err(adev->dev,
+			"MES remove queue failed: pid=%d pasid=%u queue=%u doorbell=0x%x, attempting queue reset\n",
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
+	}
 	r = reset_queues_mes(dqm, q);
 	if (r && amdgpu_gpu_recovery) {
 		dev_err(adev->dev, "failed to remove queue from MES, doorbell=0x%x\n",
@@ -442,7 +450,14 @@ static int reset_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	if (r)
 		return r;
 	/* Proceed remove_queue with reset=true */
-	remove_queue_mes_on_reset_option(dqm, q, &pdd->qpd, true, true);
+	r = remove_queue_mes_on_reset_option(dqm, q, &pdd->qpd, true, true);
+	if (r) {
+		dev_err(adev->dev,
+			"MES remove queue after reset failed: pid=%d pasid=%u queue=%u doorbell=0x%x\n",
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
+		return r;
+	}
 	set_queue_as_reset(dqm, q, &pdd->qpd);
 	return 0;
 }
@@ -1267,8 +1282,13 @@ static int suspend_single_queue(struct device_queue_manager *dqm,
 		if (dqm->dev->kfd->shared_resources.enable_mes) {
 			int r = remove_queue_mes(dqm, q, &pdd->qpd);
 
-			if (r)
+			if (r) {
+				/* MES did not acknowledge removal; leave the queue active
+				 * and retryable instead of reporting it suspended.
+				 */
+				q->properties.is_suspended = false;
 				return r;
+			}
 		}
 
 		decrement_queue_count(dqm, &pdd->qpd, q);
@@ -3005,6 +3025,19 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 	mqd_mgr = dqm->mqd_mgrs[get_mqd_type_from_queue_type(
 			q->properties.type)];
 
+	if (q->properties.is_active &&
+	    dqm->dev->kfd->shared_resources.enable_mes) {
+		retval = remove_queue_mes(dqm, q, qpd);
+		if (retval) {
+			/* Keep the queue and its resources accounted until MES removal
+			 * or a queue reset has been acknowledged.
+			 */
+			q->properties.is_being_destroyed = false;
+			dqm_unlock(dqm);
+			return retval;
+		}
+	}
+
 	deallocate_doorbell(qpd, q);
 
 	if ((q->properties.type == KFD_QUEUE_TYPE_SDMA) ||
@@ -3022,8 +3055,6 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 						      USE_DEFAULT_GRACE_PERIOD);
 			if (retval == -ETIME)
 				qpd->reset_wavefronts = true;
-		} else {
-			retval = remove_queue_mes(dqm, q, qpd);
 		}
 	}
 	list_del(&q->list);

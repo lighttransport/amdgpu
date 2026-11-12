@@ -396,7 +396,8 @@ int kfd_queue_unref_bo_vas(struct kfd_process_device *pdd,
 	int err;
 
 	vm = drm_priv_to_vm(pdd->drm_priv);
-	err = amdgpu_bo_reserve(vm->root.bo, false);
+	/* Reference release is terminal cleanup and must survive signals. */
+	err = amdgpu_bo_reserve(vm->root.bo, true);
 	if (err)
 		return err;
 

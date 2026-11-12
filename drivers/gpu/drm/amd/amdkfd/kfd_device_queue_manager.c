@@ -1291,8 +1291,11 @@ static int suspend_single_queue(struct device_queue_manager *dqm,
 			}
 		}
 
-		decrement_queue_count(dqm, &pdd->qpd, q);
-		q->properties.is_active = false;
+		/* Queue-reset recovery may already have deactivated this queue. */
+		if (q->properties.is_active) {
+			decrement_queue_count(dqm, &pdd->qpd, q);
+			q->properties.is_active = false;
+		}
 	}
 
 	return 0;

@@ -243,6 +243,10 @@ void pqm_uninit(struct process_queue_manager *pqm)
 			pqm_clean_queue_resource(pqm, pqn);
 		}
 
+		/* DQM has retired the queue. Preserve mapping protections until
+		 * this point, including across failed destroy attempts.
+		 */
+		WARN_ON(kfd_queue_unref_bo_vas(pdd, &pqn->q->properties));
 		kfd_procfs_del_queue(pqn->q);
 		uninit_queue(pqn->q);
 		list_del(&pqn->process_queue_list);
@@ -682,10 +686,6 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 		 */
 		notify_dlog = pqn->q->properties.type == KFD_QUEUE_TYPE_COMPUTE &&
 			      pqn->q->properties.dispatch_record_buffer_addr;
-
-		retval = kfd_queue_unref_bo_vas(pdd, &pqn->q->properties);
-		if (retval)
-			goto err_destroy_queue;
 
 		dqm = pqn->q->device->dqm;
 		retval = dqm->ops.destroy_queue(dqm, &pdd->qpd, pqn->q);

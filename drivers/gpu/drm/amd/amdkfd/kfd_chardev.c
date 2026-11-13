@@ -1112,6 +1112,12 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	if (args->size == 0)
 		return -EINVAL;
 
+	/* Reject wrapping intervals before SVM lookup or deferred-work flushing. */
+	if (args->va_addr > U64_MAX - (args->size - 1) ||
+	    ((flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) &&
+	     args->mmap_offset > U64_MAX - (args->size - 1)))
+		return -EINVAL;
+
 	if (p->context_id != KFD_CONTEXT_ID_PRIMARY && (flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR)) {
 		pr_debug("USERPTR is not supported on non-primary kfd_process\n");
 
@@ -1133,8 +1139,8 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	    interval_tree_iter_first(&p->svms.objects,
 				     args->va_addr >> PAGE_SHIFT,
 				     (args->va_addr + args->size - 1) >> PAGE_SHIFT)) {
-		pr_err("Address: 0x%llx already allocated by SVM\n",
-			args->va_addr);
+		pr_err_ratelimited("SVM VA overlap: tgid=%d context=%u address=0x%llx size=0x%llx\n",
+			current->tgid, p->context_id, args->va_addr, args->size);
 		mutex_unlock(&p->svms.lock);
 		return -EADDRINUSE;
 	}
@@ -1146,8 +1152,9 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	    interval_tree_iter_first(&p->svms.objects,
 				     args->mmap_offset >> PAGE_SHIFT,
 				     (args->mmap_offset  + args->size - 1) >> PAGE_SHIFT)) {
-		pr_err("User Buffer Address: 0x%llx already allocated by SVM\n",
-			args->mmap_offset);
+		pr_err_ratelimited("SVM USERPTR overlap: tgid=%d context=%u address=0x%llx size=0x%llx\n",
+			current->tgid, p->context_id, args->mmap_offset,
+			args->size);
 		mutex_unlock(&p->svms.lock);
 		return -EADDRINUSE;
 	}
@@ -1246,7 +1253,7 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	idr_handle = kfd_process_device_create_obj_handle(pdd, mem,
 			args->va_addr, args->size, cpuva, mem_type, -1);
 	if (idr_handle < 0) {
-		err = -EFAULT;
+		err = idr_handle;
 		goto err_free;
 	}
 

@@ -40,8 +40,8 @@
 #include "amdgpu_vm.h"		/* drm_priv_to_vm */
 #include "amdgpu_reset.h"
 
-static inline struct process_queue_node *get_queue_by_qid(
-			struct process_queue_manager *pqm, unsigned int qid)
+static inline struct process_queue_node *
+get_queue_by_qid_for_cleanup(struct process_queue_manager *pqm, unsigned int qid)
 {
 	struct process_queue_node *pqn;
 
@@ -52,6 +52,17 @@ static inline struct process_queue_node *get_queue_by_qid(
 	}
 
 	return NULL;
+}
+
+/* Failed creations are cleanup-only: do not expose them to queue updates. */
+static inline struct process_queue_node *
+get_queue_by_qid(struct process_queue_manager *pqm, unsigned int qid)
+{
+	struct process_queue_node *pqn = get_queue_by_qid_for_cleanup(pqm, qid);
+
+	if (pqn && pqn->q && pqn->q->properties.is_create_failed)
+		return NULL;
+	return pqn;
 }
 
 static int assign_queue_slot_by_qid(struct process_queue_manager *pqm,
@@ -243,10 +254,6 @@ void pqm_uninit(struct process_queue_manager *pqm)
 			pqm_clean_queue_resource(pqm, pqn);
 		}
 
-		/* DQM has retired the queue. Preserve mapping protections until
-		 * this point, including across failed destroy attempts.
-		 */
-		WARN_ON(kfd_queue_unref_bo_vas(pdd, &pqn->q->properties));
 		kfd_procfs_del_queue(pqn->q);
 		uninit_queue(pqn->q);
 		list_del(&pqn->process_queue_list);
@@ -463,6 +470,8 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 	    KFD_GC_VERSION(dev) == IP_VERSION(12, 1, 0))
 		max_queues = 255;
 
+	/* Output ownership marker is false on every pre-submission failure. */
+	properties->is_create_failed = false;
 	q = NULL;
 	kq = NULL;
 
@@ -591,6 +600,11 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 		else
 			pr_err("process pid %d DQM create queue type %d failed. ret %d\n",
 				pqm->process->lead_thread->pid, type, retval);
+		if (q && q->properties.is_create_failed) {
+			/* Transfer buffer/mapping ownership even though create failed. */
+			properties->is_create_failed = true;
+			goto retain_queue;
+		}
 		goto err_create_queue;
 	}
 
@@ -612,6 +626,7 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 
 	pr_debug("PQM After DQM create queue\n");
 
+retain_queue:
 	list_add(&pqn->process_queue_list, &pqm->queues);
 
 	if (q) {
@@ -620,12 +635,14 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 		print_queue_properties(&q->properties);
 	}
 
-	if (pqn->q)
+	if (!retval && pqn->q)
 		kfd_dispatch_log_autoarm_queue(pqm->process, pqn->q);
 
 	return retval;
 
 err_create_queue:
+	if (q)
+		pqm_clean_queue_resource(pqm, pqn);
 	uninit_queue(q);
 	if (kq)
 		kernel_queue_uninit(kq);
@@ -652,7 +669,7 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 
 	retval = 0;
 
-	pqn = get_queue_by_qid(pqm, qid);
+	pqn = get_queue_by_qid_for_cleanup(pqm, qid);
 	if (!pqn) {
 		pr_err("Queue id does not match any known queue\n");
 		return -EINVAL;
@@ -707,6 +724,10 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 			if (retval != -ETIME && retval != -EIO)
 				goto err_destroy_queue;
 		}
+		/* DQM has retired the queue. Preserve mapping protections until
+		 * this point, including across failed destroy attempts.
+		 */
+		WARN_ON(kfd_queue_unref_bo_vas(pdd, &pqn->q->properties));
 		kfd_procfs_del_queue(pqn->q);
 		kfd_queue_release_buffers(pdd, &pqn->q->properties);
 		pqm_clean_queue_resource(pqm, pqn);

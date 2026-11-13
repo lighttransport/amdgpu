@@ -41,6 +41,7 @@
 #include <linux/sysfs.h>
 #include <linux/interval_tree.h>
 #include <linux/semaphore.h>
+#include <linux/wait.h>
 /* amdkcl: this header file is included in kcl_device_cgroup.h
 #include <linux/device_cgroup.h>*/
 #include <drm/drm_file.h>
@@ -410,6 +411,10 @@ struct kfd_dev {
 
 	bool init_complete;
 
+	/* Global suspend/reset references, protected by kfd_processes_mutex. */
+	unsigned int suspend_count;
+	bool reset_locked;
+
 	/* Firmware versions */
 	uint16_t mec_fw_version;
 	uint16_t mec2_fw_version;
@@ -451,6 +456,7 @@ struct kfd_dev {
 	int kfd_dev_lock;
 
 	atomic_t kfd_processes_count;
+	wait_queue_head_t process_exit_wait;
 
 	/* Lock for profiler process */
 	struct mutex profiler_lock;
@@ -611,6 +617,8 @@ struct queue_properties {
 	bool is_evicted;
 	bool is_suspended;
 	bool is_being_destroyed;
+	/* Failed MES create retained by PQM; also signals caller ownership transfer. */
+	bool is_create_failed;
 	bool is_active;
 	bool is_gws;
 	uint32_t pm4_target_xcc;
@@ -653,8 +661,9 @@ struct queue_properties {
 #define QUEUE_IS_ACTIVE(q) ((q).queue_size > 0 &&	\
 			    (q).queue_address != 0 &&	\
 			    (q).queue_percent > 0 &&	\
-			    !(q).is_evicted &&		\
-			    !(q).is_suspended)
+			    !(q).is_evicted &&	\
+			    !(q).is_suspended &&	\
+			    !(q).is_create_failed)
 
 enum mqd_update_flag {
 	UPDATE_FLAG_DBG_WA_ENABLE = 1,
@@ -718,6 +727,10 @@ struct queue {
 	struct kfd_mem_obj *mqd_mem_obj;
 	uint64_t gart_mqd_addr;
 	struct queue_properties properties;
+	/* DQM-serialized: no MES submission since the last acknowledged removal. */
+	bool mes_queue_removed;
+	/* DQM-serialized: a failed no-CP eviction still needs a confirmed drain. */
+	bool eviction_drain_pending;
 
 	uint32_t mec;
 	uint32_t pipe;
@@ -781,6 +794,19 @@ struct process_queue_manager {
 	unsigned long		*queue_slot_bitmap;
 };
 
+/* Each per-device eviction reference belongs to one independent caller. */
+enum kfd_eviction_owner {
+	KFD_EVICTION_OWNER_SVM,
+	KFD_EVICTION_OWNER_USERPTR,
+	KFD_EVICTION_OWNER_TTM,
+	KFD_EVICTION_OWNER_SUSPEND,
+	KFD_EVICTION_OWNER_CRIU_CHECKPOINT,
+	KFD_EVICTION_OWNER_CRIU_RESTORE,
+	KFD_EVICTION_OWNER_QUARANTINE,
+	KFD_EVICTION_OWNER_FAULT,
+	KFD_EVICTION_OWNER_COUNT,
+};
+
 struct qcm_process_device {
 	/* The Device Queue Manager that owns this data */
 	struct device_queue_manager *dqm;
@@ -793,6 +819,12 @@ struct qcm_process_device {
 	unsigned int vmid;
 	bool is_debug;
 	unsigned int evicted; /* eviction counter, 0=active */
+	/* Per-device owner counts, protected by the DQM lock. */
+	unsigned int eviction_refs[KFD_EVICTION_OWNER_COUNT];
+	/* A failed runlist drain must be retried before restore or MQD release. */
+	bool eviction_drain_pending;
+	/* Subset reserved for TTM; protected by the DQM lock. */
+	unsigned int ttm_reserved;
 
 	/* This flag tells if we should reset all wavefronts on
 	 * process termination
@@ -912,6 +944,8 @@ struct kfd_process_device {
 
 	/* per-process-per device QCM data structure */
 	struct qcm_process_device qpd;
+	/* TTM-owned DQM references, protected by process->ttm_restore_lock. */
+	unsigned int ttm_evicted;
 
 	/*Apertures*/
 	uint64_t lds_base;
@@ -1190,6 +1224,9 @@ struct kfd_process {
 	struct dma_fence __rcu *ef;
 
 	/* Work items for evicting and restoring BOs */
+	struct mutex ttm_restore_lock;
+	bool ttm_bos_pending;
+	u64 ttm_restore_epoch;
 	struct delayed_work eviction_work;
 	struct delayed_work restore_work;
 	/* seqno of the last scheduled eviction */
@@ -1324,7 +1361,7 @@ static inline struct kfd_process_device *kfd_process_device_from_gpuidx(
 
 void kfd_unref_process(struct kfd_process *p);
 int kfd_process_evict_queues(struct kfd_process *p, bool force, uint32_t trigger);
-int kfd_process_restore_queues(struct kfd_process *p);
+int kfd_process_restore_queues(struct kfd_process *p, uint32_t trigger);
 void kfd_suspend_all_processes(bool force);
 int kfd_resume_all_processes(void);
 

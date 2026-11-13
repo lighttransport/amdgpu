@@ -1027,6 +1027,11 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	struct ttm_operation_ctx ctx = { false, false };
+	u64 old_flags = bo->flags;
+	u32 requested_domains = domain;
+#ifdef HAVE_STRUCT_DMA_BUF_OPS_PIN
+	bool dma_buf_pinned = false;
+#endif
 	int r, i;
 
 	if (amdgpu_ttm_tt_get_usermm(bo->tbo.ttm))
@@ -1066,8 +1071,12 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
 	domain = amdgpu_bo_get_preferred_domain(adev, domain);
 
 #ifdef HAVE_STRUCT_DMA_BUF_OPS_PIN
-	if (drm_gem_is_imported(&bo->tbo.base))
-		dma_buf_pin(bo->tbo.base.import_attach);
+	if (drm_gem_is_imported(&bo->tbo.base)) {
+		r = dma_buf_pin(bo->tbo.base.import_attach);
+		if (r)
+			return r;
+		dma_buf_pinned = true;
+	}
 #endif
 
 	/* force to pin into visible video ram */
@@ -1081,12 +1090,37 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
 	}
 
 	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+	/*
+	 * A scanout BO can prefer VRAM while still allowing GTT. If the
+	 * preference intersection removed GTT, TTM never gets its normal
+	 * fallback placement after a fragmented contiguous-VRAM allocation.
+	 */
+	if (unlikely(r == -ENOMEM || r == -ENOSPC) &&
+	    (requested_domains & AMDGPU_GEM_DOMAIN_GTT) &&
+	    !(domain & AMDGPU_GEM_DOMAIN_GTT) &&
+	    (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT) &&
+	    (bo->flags & AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS) &&
+	    (bo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC) &&
+	    bo->tbo.type == ttm_bo_type_device &&
+	    !drm_gem_is_imported(&bo->tbo.base) && adev->dc_enabled &&
+	    adev->mode_info.gpu_vm_support && amdgpu_bo_support_uswc(bo->flags)) {
+		dev_dbg(adev->dev,
+			"%p contiguous VRAM pin failed (%d), retrying in GTT\n",
+			bo, r);
+		domain = AMDGPU_GEM_DOMAIN_GTT;
+		amdgpu_bo_placement_from_domain(bo, domain);
+		r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+	}
 	if (unlikely(r)) {
 		dev_err(adev->dev, "%p pin failed\n", bo);
 		goto error;
 	}
 
 	ttm_bo_pin(&bo->tbo);
+	/* The BO's final unpin now owns the dma_buf pin reference. */
+#ifdef HAVE_STRUCT_DMA_BUF_OPS_PIN
+	dma_buf_pinned = false;
+#endif
 
 	if (bo->tbo.resource->mem_type == TTM_PL_VRAM) {
 		atomic64_add(amdgpu_bo_size(bo), &adev->vram_pin_size);
@@ -1097,6 +1131,11 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
 	}
 
 error:
+	bo->flags = old_flags;
+#ifdef HAVE_STRUCT_DMA_BUF_OPS_PIN
+	if (dma_buf_pinned)
+		dma_buf_unpin(bo->tbo.base.import_attach);
+#endif
 	return r;
 }
 
@@ -1551,8 +1590,9 @@ int amdgpu_bo_sync_wait_resv(struct amdgpu_device *adev, struct dma_resv *resv,
 	int r;
 
 	amdgpu_sync_create(&sync);
-	amdgpu_sync_resv(adev, &sync, resv, sync_mode, owner);
-	r = amdgpu_sync_wait(&sync, intr);
+	r = amdgpu_sync_resv(adev, &sync, resv, sync_mode, owner);
+	if (!r)
+		r = amdgpu_sync_wait(&sync, intr);
 	amdgpu_sync_free(&sync);
 	return r;
 }

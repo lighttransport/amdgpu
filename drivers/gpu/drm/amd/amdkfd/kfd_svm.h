@@ -34,6 +34,9 @@
 #include "amdgpu.h"
 #include "kfd_priv.h"
 
+struct page;
+struct device;
+
 #define SVM_RANGE_VRAM_DOMAIN (1UL << 0)
 #define SVM_ADEV_PGMAP_OWNER(adev)\
 			((adev)->hive ? (void *)(adev)->hive : (void *)(adev))
@@ -121,6 +124,9 @@ struct svm_range {
 	uint64_t			npages;
 	uint64_t			vram_pages;
 	dma_addr_t			*dma_addr[MAX_GPU_INSTANCE];
+	struct device		*dma_dev[MAX_GPU_INSTANCE];
+	/* Own CPU backing pages for each device DMA mapping. HMM PFNs are transient. */
+	struct page			**pages[MAX_GPU_INSTANCE];
 	struct ttm_resource		*ttm_res;
 	uint64_t			offset;
 	struct svm_range_bo		*svm_bo;
@@ -135,6 +141,7 @@ struct svm_range {
 	atomic_t			invalid;
 	ktime_t				validate_timestamp;
 	struct mmu_interval_notifier	notifier;
+	bool				notifier_registered;
 	struct svm_work_list_item	work_item;
 	struct list_head		deferred_list;
 	struct list_head		child_list;
@@ -167,7 +174,7 @@ static inline struct svm_range_bo *svm_range_bo_ref(struct svm_range_bo *svm_bo)
 }
 
 int svm_range_list_init(struct kfd_process *p);
-void svm_range_list_fini(struct kfd_process *p);
+int svm_range_list_fini(struct kfd_process *p);
 int svm_ioctl(struct kfd_process *p, enum kfd_ioctl_svm_op op, uint64_t start,
 	      uint64_t size, uint32_t nattrs,
 	      struct kfd_ioctl_svm_attribute *attrs);
@@ -225,9 +232,11 @@ static inline int svm_range_list_init(struct kfd_process *p)
 {
 	return 0;
 }
-static inline void svm_range_list_fini(struct kfd_process *p)
+
+static inline int svm_range_list_fini(struct kfd_process *p)
 {
 	/* empty */
+	return 0;
 }
 
 static inline int svm_range_restore_pages(struct amdgpu_device *adev,

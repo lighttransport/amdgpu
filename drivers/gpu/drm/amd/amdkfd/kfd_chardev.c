@@ -449,8 +449,11 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 	return 0;
 
 err_create_queue:
-	kfd_queue_unref_bo_vas(pdd, &q_properties);
-	kfd_queue_release_buffers(pdd, &q_properties);
+	/* PQM owns the original references when MES removal is unconfirmed. */
+	if (!q_properties.is_create_failed) {
+		kfd_queue_unref_bo_vas(pdd, &q_properties);
+		kfd_queue_release_buffers(pdd, &q_properties);
+	}
 err_acquire_queue_buf:
 err_sdma_engine_id:
 err_bind_process:
@@ -3048,7 +3051,8 @@ static int criu_unpause(struct file *filep,
 		return -EINVAL;
 	}
 
-	ret = kfd_process_restore_queues(p);
+	ret = kfd_process_restore_queues(p,
+					 KFD_QUEUE_EVICTION_CRIU_RESTORE);
 	if (ret)
 		pr_err("Failed to unpause queues ret:%d\n", ret);
 	else
@@ -3138,7 +3142,8 @@ static int criu_process_info(struct file *filep,
 
 err_unlock:
 	if (ret) {
-		kfd_process_restore_queues(p);
+		kfd_process_restore_queues(p,
+					   KFD_QUEUE_EVICTION_CRIU_CHECKPOINT);
 		p->queues_paused = false;
 	}
 	mutex_unlock(&p->mutex);

@@ -506,6 +506,7 @@ struct kfd_dev *kgd2kfd_probe(struct amdgpu_device *adev, bool vf)
 
 	ida_init(&kfd->doorbell_ida);
 	atomic_set(&kfd->kfd_processes_count, 0);
+	init_waitqueue_head(&kfd->process_exit_wait);
 
 	return kfd;
 }
@@ -1004,6 +1005,9 @@ out:
 
 void kgd2kfd_device_exit(struct kfd_dev *kfd)
 {
+	/* Keep node/DQM owners alive until process release drains its SVM state. */
+	kgd2kfd_teardown_processes(kfd->adev);
+
 	if (kfd->init_complete) {
 		kfd_ais_deinit(kfd->adev);
 		/* Cleanup KFD nodes */
@@ -1016,10 +1020,17 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
 		mutex_destroy(&kfd->profiler_lock);
 	}
 
-	kfree(kfd);
+	/* Drop only global references owned by the device being removed. */
+	mutex_lock(&kfd_processes_mutex);
+	kfd_locked -= kfd->suspend_count;
+	kfd->suspend_count = 0;
+	if (kfd->reset_locked) {
+		--kfd_locked;
+		kfd->reset_locked = false;
+	}
+	mutex_unlock(&kfd_processes_mutex);
 
-	/* after remove a kfd device unlock kfd driver */
-	kgd2kfd_unlock_kfd(NULL);
+	kfree(kfd);
 }
 
 int kgd2kfd_pre_reset(struct kfd_dev *kfd,
@@ -1036,7 +1047,16 @@ int kgd2kfd_pre_reset(struct kfd_dev *kfd,
 		kfd_smi_event_update_gpu_reset(node, false, reset_context);
 	}
 
-	kgd2kfd_suspend(kfd, true, true);
+	/* A failed reset retains this reference for the next attempt. */
+	mutex_lock(&kfd_processes_mutex);
+	if (!kfd->reset_locked) {
+		kfd->reset_locked = true;
+		if (++kfd_locked == 1)
+			kfd_suspend_all_processes(true);
+	}
+	mutex_unlock(&kfd_processes_mutex);
+
+	kgd2kfd_suspend(kfd, false, true);
 
 	for (i = 0; i < kfd->num_nodes; i++) {
 		kfd_signal_reset_event(kfd->nodes[i]);
@@ -1069,7 +1089,10 @@ int kgd2kfd_post_reset(struct kfd_dev *kfd)
 	}
 
 	mutex_lock(&kfd_processes_mutex);
-	--kfd_locked;
+	if (kfd->reset_locked) {
+		kfd->reset_locked = false;
+		--kfd_locked;
+	}
 	mutex_unlock(&kfd_processes_mutex);
 
 	for (i = 0; i < kfd->num_nodes; i++) {
@@ -1150,6 +1173,7 @@ void kgd2kfd_suspend_process(struct kfd_dev *kfd, bool force)
 
 	mutex_lock(&kfd_processes_mutex);
 	/* For first KFD device suspend all the KFD processes */
+	++kfd->suspend_count;
 	if (++kfd_locked == 1)
 		kfd_suspend_all_processes(force);
 	mutex_unlock(&kfd_processes_mutex);
@@ -1163,9 +1187,15 @@ int kgd2kfd_resume_process(struct kfd_dev *kfd)
 		return 0;
 
 	mutex_lock(&kfd_processes_mutex);
+	if (WARN_ON_ONCE(!kfd->suspend_count)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	--kfd->suspend_count;
 	if (--kfd_locked == 0)
 		ret = kfd_resume_all_processes();
 	WARN_ONCE(kfd_locked < 0, "KFD suspend / resume ref. error");
+out:
 	mutex_unlock(&kfd_processes_mutex);
 
 	return ret;
@@ -1246,7 +1276,7 @@ int kgd2kfd_quiesce_mm(struct mm_struct *mm, uint32_t trigger)
 	return r;
 }
 
-int kgd2kfd_resume_mm(struct mm_struct *mm)
+int kgd2kfd_resume_mm(struct mm_struct *mm, uint32_t trigger)
 {
 	struct kfd_process *p;
 	int r;
@@ -1259,7 +1289,7 @@ int kgd2kfd_resume_mm(struct mm_struct *mm)
 	if (!p)
 		return -ESRCH;
 
-	r = kfd_process_restore_queues(p);
+	r = kfd_process_restore_queues(p, trigger);
 
 	kfd_unref_process(p);
 	return r;
@@ -1610,14 +1640,12 @@ out:
 	return r;
 }
 
-/* unlock a kfd dev or kfd driver */
+/* Unlock a KFD device after partition switching. */
 void kgd2kfd_unlock_kfd(struct kfd_dev *kfd)
 {
 	mutex_lock(&kfd_processes_mutex);
 	if (kfd)
 		--kfd->kfd_dev_lock;
-	else
-		--kfd_locked;
 	mutex_unlock(&kfd_processes_mutex);
 }
 
@@ -1813,16 +1841,14 @@ void kgd2kfd_teardown_processes(struct amdgpu_device *adev)
 {
 	struct hlist_node *p_temp;
 	struct kfd_process *p;
+	struct kfd_dev *kfd = adev->kfd.dev;
 	struct kfd_node *dev;
 	unsigned int temp;
 
-	mutex_lock(&kfd_processes_mutex);
-
-	if (hash_empty(kfd_processes_table)) {
-		mutex_unlock(&kfd_processes_mutex);
+	if (!kfd)
 		return;
-	}
 
+	mutex_lock(&kfd_processes_mutex);
 	hash_for_each_safe(kfd_processes_table, temp, p_temp, p, kfd_processes) {
 		for (int i = 0; i < p->n_pdds; i++) {
 			dev = p->pdds[i]->dev;
@@ -1833,9 +1859,9 @@ void kgd2kfd_teardown_processes(struct amdgpu_device *adev)
 
 	mutex_unlock(&kfd_processes_mutex);
 
-	/* wait all kfd processes use adev terminate */
-	while (!!atomic_read(&adev->kfd.dev->kfd_processes_count))
-		cond_resched();
+	/* A process stays counted until its PDD owners are actually released. */
+	wait_event(kfd->process_exit_wait,
+		   !atomic_read(&kfd->kfd_processes_count));
 }
 
 int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,

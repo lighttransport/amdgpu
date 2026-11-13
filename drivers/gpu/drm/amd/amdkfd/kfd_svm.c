@@ -22,6 +22,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/delay.h>
 #include <linux/sched/task.h>
 #include <linux/dynamic_debug.h>
 #include <drm/ttm/ttm_tt.h>
@@ -111,11 +112,14 @@ svm_range_add_notifier_locked(struct mm_struct *mm, struct svm_range *prange)
 {
 	pr_debug("svms 0x%p prange 0x%p [0x%lx 0x%lx]\n", prange->svms,
 		 prange, prange->start, prange->last);
-
-	mmu_interval_notifier_insert_locked(&prange->notifier, mm,
-				     prange->start << PAGE_SHIFT,
-				     prange->npages << PAGE_SHIFT,
-				     &svm_range_mn_ops);
+	if (!mmu_interval_notifier_insert_locked(&prange->notifier, mm,
+						 prange->start << PAGE_SHIFT,
+					 prange->npages << PAGE_SHIFT,
+					 &svm_range_mn_ops))
+		prange->notifier_registered = true;
+	else
+		pr_err("failed to register SVM notifier for [%lx, %lx]\n",
+		       prange->start, prange->last);
 }
 
 /**
@@ -144,9 +148,10 @@ static void svm_range_remove_notifier(struct svm_range *prange)
 		 prange->notifier.interval_tree.start >> PAGE_SHIFT,
 		 prange->notifier.interval_tree.last >> PAGE_SHIFT);
 
-	if (prange->notifier.interval_tree.start != 0 &&
-	    prange->notifier.interval_tree.last != 0)
+	if (prange->notifier_registered) {
 		mmu_interval_notifier_remove(&prange->notifier);
+		prange->notifier_registered = false;
+	}
 }
 
 static bool
@@ -163,9 +168,11 @@ svm_range_dma_map_dev(struct amdgpu_device *adev, struct svm_range *prange,
 {
 	enum dma_data_direction dir = DMA_BIDIRECTIONAL;
 	dma_addr_t *addr = prange->dma_addr[gpuidx];
+	struct page **pages = prange->pages[gpuidx];
 	struct device *dev = adev->dev;
 	struct page *page;
-	int i, r;
+	unsigned long i;
+	int r;
 
 	if (!addr) {
 		addr = kvzalloc_objs(*addr, prange->npages);
@@ -173,15 +180,33 @@ svm_range_dma_map_dev(struct amdgpu_device *adev, struct svm_range *prange,
 			return -ENOMEM;
 		prange->dma_addr[gpuidx] = addr;
 	}
+	if (!pages) {
+		pages = kvcalloc(prange->npages, sizeof(*pages), GFP_KERNEL);
+		if (!pages)
+			return -ENOMEM;
+		prange->pages[gpuidx] = pages;
+	}
+	if (prange->dma_dev[gpuidx] && prange->dma_dev[gpuidx] != dev)
+		return -EXDEV;
+	if (!prange->dma_dev[gpuidx])
+		prange->dma_dev[gpuidx] = get_device(dev);
 
 	addr += offset;
+	pages += offset;
 	for (i = 0; i < npages; i++) {
-		if (svm_is_valid_dma_mapping_addr(dev, addr[i]))
-			dma_unmap_page(dev, addr[i], PAGE_SIZE, dir);
-
 		page = hmm_pfn_to_page(hmm_pfns[i]);
 		if (is_zone_device_page(page)) {
 			struct amdgpu_device *bo_adev = prange->svm_bo->node->adev;
+
+			if (test_bit(gpuidx, prange->bitmap_mapped) && pages[i])
+				return -EBUSY;
+			if (svm_is_valid_dma_mapping_addr(dev, addr[i]))
+				dma_unmap_page(dev, addr[i], PAGE_SIZE, dir);
+			addr[i] = 0;
+			if (pages[i]) {
+				put_page(pages[i]);
+				pages[i] = NULL;
+			}
 
 			addr[i] = (hmm_pfns[i] << PAGE_SHIFT) +
 				   bo_adev->vm_manager.vram_base_offset -
@@ -193,6 +218,24 @@ svm_range_dma_map_dev(struct amdgpu_device *adev, struct svm_range *prange,
 			addr[i] |= SVM_RANGE_VRAM_DOMAIN;
 			pr_debug_ratelimited("vram address: 0x%llx\n", addr[i]);
 			continue;
+		}
+
+		/* Keep the CPU backing alive after the transient HMM PFN array goes away. */
+		if (pages[i] == page &&
+		    svm_is_valid_dma_mapping_addr(dev, addr[i])) {
+			/* Reuse the live mapping; its IOVA may not be reproducible. */
+			continue;
+		}
+		if (test_bit(gpuidx, prange->bitmap_mapped))
+			return -EBUSY;
+		if (svm_is_valid_dma_mapping_addr(dev, addr[i]))
+			dma_unmap_page(dev, addr[i], PAGE_SIZE, dir);
+		addr[i] = 0;
+		if (pages[i] != page) {
+			get_page(page);
+			if (pages[i])
+				put_page(pages[i]);
+			pages[i] = page;
 		}
 		addr[i] = dma_map_page(dev, page, 0, PAGE_SIZE, dir);
 		r = dma_mapping_error(dev, addr[i]);
@@ -257,27 +300,44 @@ void svm_range_dma_unmap_dev(struct device *dev, dma_addr_t *dma_addr,
 
 void svm_range_dma_unmap(struct svm_range *prange)
 {
-	struct kfd_process_device *pdd;
 	dma_addr_t *dma_addr;
-	struct device *dev;
-	struct kfd_process *p;
 	uint32_t gpuidx;
-
-	p = container_of(prange->svms, struct kfd_process, svms);
 
 	for (gpuidx = 0; gpuidx < MAX_GPU_INSTANCE; gpuidx++) {
 		dma_addr = prange->dma_addr[gpuidx];
-		if (!dma_addr)
+		if (!dma_addr || !prange->dma_dev[gpuidx])
+			continue;
+		svm_range_dma_unmap_dev(prange->dma_dev[gpuidx], dma_addr, 0,
+					prange->npages);
+	}
+}
+
+static void svm_range_put_pages(struct svm_range *prange)
+{
+	u32 gpuidx;
+	unsigned long i;
+
+	for (gpuidx = 0; gpuidx < MAX_GPU_INSTANCE; gpuidx++) {
+		if (!prange->pages[gpuidx])
 			continue;
 
-		pdd = kfd_process_device_from_gpuidx(p, gpuidx);
-		if (!pdd) {
-			pr_debug("failed to find device idx %d\n", gpuidx);
-			continue;
-		}
-		dev = &pdd->dev->adev->pdev->dev;
+		for (i = 0; i < prange->npages; i++)
+			if (prange->pages[gpuidx][i])
+				put_page(prange->pages[gpuidx][i]);
+		kvfree(prange->pages[gpuidx]);
+		prange->pages[gpuidx] = NULL;
+	}
+}
 
-		svm_range_dma_unmap_dev(dev, dma_addr, 0, prange->npages);
+static void svm_range_put_dma_devs(struct svm_range *prange)
+{
+	u32 gpuidx;
+
+	for (gpuidx = 0; gpuidx < MAX_GPU_INSTANCE; gpuidx++) {
+		if (!prange->dma_dev[gpuidx])
+			continue;
+		put_device(prange->dma_dev[gpuidx]);
+		prange->dma_dev[gpuidx] = NULL;
 	}
 }
 
@@ -286,6 +346,13 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 	uint64_t size = (prange->last - prange->start + 1) << PAGE_SHIFT;
 	struct kfd_process *p = container_of(prange->svms, struct kfd_process, svms);
 	uint32_t gpuidx;
+
+	/* A failed GPU unmap keeps both the DMA mapping and its backing pages live. */
+	if (do_unmap && !bitmap_empty(prange->bitmap_mapped, MAX_GPU_INSTANCE)) {
+		pr_err("retain SVM [%lx, %lx]: GPU mapping still live\n",
+		       prange->start, prange->last);
+		return;
+	}
 
 	pr_debug("svms 0x%p prange 0x%p [0x%lx 0x%lx]\n", prange->svms, prange,
 		 prange->start, prange->last);
@@ -304,6 +371,8 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 	svm_range_vram_node_free(prange);
 	if (do_unmap)
 		svm_range_dma_unmap(prange);
+	svm_range_put_pages(prange);
+	svm_range_put_dma_devs(prange);
 
 	if (do_unmap && !p->xnack_enabled) {
 		pr_debug("unreserve prange 0x%p size: 0x%llx\n", prange, size);
@@ -993,15 +1062,89 @@ svm_range_copy_dma_addrs(struct svm_range *dst, struct svm_range *src)
 	int i;
 
 	for (i = 0; i < MAX_GPU_INSTANCE; i++) {
-		if (!src->dma_addr[i])
-			continue;
-		dst->dma_addr[i] = svm_range_copy_array(src->dma_addr[i],
-					sizeof(*src->dma_addr[i]), src->npages, 0, NULL);
-		if (!dst->dma_addr[i])
-			return -ENOMEM;
+		if (src->dma_dev[i])
+			dst->dma_dev[i] = get_device(src->dma_dev[i]);
+		if (src->dma_addr[i]) {
+			dst->dma_addr[i] = svm_range_copy_array(src->dma_addr[i],
+								sizeof(*src->dma_addr[i]),
+								src->npages, 0, NULL);
+			if (!dst->dma_addr[i])
+				return -ENOMEM;
+		}
+		if (src->pages[i]) {
+			unsigned long j;
+
+			dst->pages[i] = kvcalloc(src->npages,
+						 sizeof(*dst->pages[i]), GFP_KERNEL);
+			if (!dst->pages[i])
+				return -ENOMEM;
+			memcpy(dst->pages[i], src->pages[i],
+			       src->npages * sizeof(*dst->pages[i]));
+			for (j = 0; j < src->npages; j++)
+				if (dst->pages[i][j])
+					get_page(dst->pages[i][j]);
+		}
 	}
 
 	return 0;
+}
+
+static int
+svm_range_split_page_refs(struct svm_range *new, struct svm_range *old,
+			  u64 start)
+{
+	struct page ***new_pages;
+	struct page ***old_pages;
+	u64 new_offset = new->start - old->start;
+	u64 old_offset = new->start == old->start ? new->npages : 0;
+	int i;
+
+	new_pages = kvcalloc(MAX_GPU_INSTANCE, sizeof(*new_pages), GFP_KERNEL);
+	old_pages = kvcalloc(MAX_GPU_INSTANCE, sizeof(*old_pages), GFP_KERNEL);
+	if (!new_pages || !old_pages)
+		goto err_free;
+
+	for (i = 0; i < MAX_GPU_INSTANCE; i++) {
+		struct page **src = old->pages[i];
+
+		if (!src)
+			continue;
+		new_pages[i] = kvcalloc(new->npages, sizeof(*new_pages[i]),
+					GFP_KERNEL);
+		old_pages[i] = kvcalloc(start, sizeof(*old_pages[i]),
+					GFP_KERNEL);
+		if (!new_pages[i] || !old_pages[i])
+			goto err_free;
+
+		memcpy(new_pages[i], src + new_offset,
+		       new->npages * sizeof(*new_pages[i]));
+		memcpy(old_pages[i], src + old_offset,
+		       start * sizeof(*old_pages[i]));
+	}
+
+	/* The split partitions the existing references; it does not duplicate them. */
+	for (i = 0; i < MAX_GPU_INSTANCE; i++) {
+		if (!old->pages[i])
+			continue;
+		kvfree(old->pages[i]);
+		old->pages[i] = old_pages[i];
+		new->pages[i] = new_pages[i];
+	}
+	kvfree(new_pages);
+	kvfree(old_pages);
+
+	return 0;
+
+err_free:
+	if (new_pages)
+		for (i = 0; i < MAX_GPU_INSTANCE; i++)
+			kvfree(new_pages[i]);
+	if (old_pages)
+		for (i = 0; i < MAX_GPU_INSTANCE; i++)
+			kvfree(old_pages[i]);
+	kvfree(new_pages);
+	kvfree(old_pages);
+	return -ENOMEM;
 }
 
 static int
@@ -1051,6 +1194,12 @@ svm_range_split_pages(struct svm_range *new, struct svm_range *old,
 		if (r)
 			return r;
 	}
+	r = svm_range_split_page_refs(new, old, npages);
+	if (r)
+		return r;
+	for (i = 0; i < MAX_GPU_INSTANCE; i++)
+		if (old->dma_dev[i])
+			new->dma_dev[i] = get_device(old->dma_dev[i]);
 	if (old->actual_loc)
 		old->vram_pages -= new->vram_pages;
 
@@ -1442,24 +1591,21 @@ svm_range_unmap_from_gpus(struct svm_range *prange, unsigned long start,
 			  uint32_t trigger)
 {
 	struct kfd_process_device *pdd;
-	struct dma_fence *fence = NULL;
 	struct kfd_process *p;
 	uint32_t gpuidx;
-	int r = 0;
+	int ret = 0;
 
 	p = container_of(prange->svms, struct kfd_process, svms);
 
 	for_each_set_bit(gpuidx, bitmap_unmap, MAX_GPU_INSTANCE) {
-		if (prange->start == start && prange->last == last) {
-			pr_debug("unmap svms 0x%p prange 0x%p from gpu_idx 0x%x\n",
-				 prange->svms, prange, gpuidx);
-			clear_bit(gpuidx, prange->bitmap_mapped);
-		}
+		struct dma_fence *fence = NULL;
+		int r;
 
 		pdd = kfd_process_device_from_gpuidx(p, gpuidx);
 		if (!pdd) {
 			pr_debug("failed to find device idx %d\n", gpuidx);
-			return -EINVAL;
+			r = -EINVAL;
+			goto next_device;
 		}
 
 		kfd_smi_event_unmap_from_gpu(pdd->dev, p->lead_thread,
@@ -1468,20 +1614,30 @@ svm_range_unmap_from_gpus(struct svm_range *prange, unsigned long start,
 		r = svm_range_unmap_from_gpu(pdd->dev->adev,
 					     drm_priv_to_vm(pdd->drm_priv),
 					     start, last, &fence);
-		if (r)
-			break;
-
-		if (fence) {
+		if (!r && fence) {
 			r = dma_fence_wait(fence, false);
-			dma_fence_put(fence);
-			fence = NULL;
-			if (r)
-				break;
+			if (!r) {
+				r = dma_fence_get_status(fence);
+				if (r > 0)
+					r = 0;
+				else if (!r)
+					r = -EAGAIN;
+			}
 		}
+		dma_fence_put(fence);
+		if (r)
+			goto next_device;
+
 		kfd_flush_tlb(pdd);
+		/* A failed update or fence must retain the mapping obligation. */
+		if (prange->start == start && prange->last == last)
+			clear_bit(gpuidx, prange->bitmap_mapped);
+next_device:
+		if (r && !ret)
+			ret = r;
 	}
 
-	return r;
+	return ret;
 }
 
 static int
@@ -1844,8 +2000,9 @@ static int svm_range_validate_and_map(struct mm_struct *mm,
 				svm_range_lock(prange);
 				if (vma->vm_flags & VM_WRITE)
 					pr_debug("VM_WRITE without VM_READ is not supported");
-				s = max(start, prange->start);
-				e = min(end, prange->last);
+				/* VMA cursor is in bytes; SVM unmap uses inclusive pages. */
+				s = max(addr >> PAGE_SHIFT, prange->start);
+				e = min((next >> PAGE_SHIFT) - 1, prange->last);
 				if (e >= s)
 					r = svm_range_unmap_from_gpus(prange, s, e,
 						       prange->bitmap_mapped,
@@ -2023,7 +2180,7 @@ static void svm_range_restore_work(struct work_struct *work)
 
 	evicted_ranges = 0;
 
-	r = kgd2kfd_resume_mm(mm);
+	r = kgd2kfd_resume_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
 	if (r) {
 		/* No recovery from this failure. Probably the CP is
 		 * hanging. No point trying again.
@@ -2111,10 +2268,16 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
 		pr_debug("evicting svms 0x%p range [0x%lx 0x%lx]\n",
 			 prange->svms, prange->start, prange->last);
 
-		/* First eviction, stop the queues */
-		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
-		if (r)
-			pr_debug("failed to quiesce KFD\n");
+		/* The blockable notifier must not return before queues are stopped. */
+		do {
+			r = kfd_process_evict_queues(p, true,
+						     KFD_QUEUE_EVICTION_TRIGGER_SVM);
+			if (r) {
+				pr_err_ratelimited("SVM invalidation queue drain failed %d; retrying before notifier return\n",
+						   r);
+				msleep(100);
+			}
+		} while (r);
 
 		pr_debug("schedule to restore svm %p ranges\n", svms);
 		queue_delayed_work(system_freezable_wq, &svms->restore_work,
@@ -2122,6 +2285,7 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
 	} else {
 		unsigned long s, l;
 		uint32_t trigger;
+		int r_tmp;
 
 		if (event == MMU_NOTIFY_MIGRATE)
 			trigger = KFD_SVM_UNMAP_TRIGGER_MMU_NOTIFY_MIGRATE;
@@ -2134,15 +2298,23 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
 			mutex_lock_nested(&pchild->lock, 1);
 			s = max(start, pchild->start);
 			l = min(last, pchild->last);
-			if (l >= s)
-				svm_range_unmap_from_gpus(pchild, s, l, prange->bitmap_mapped,
-							  trigger);
+			if (l >= s) {
+				r_tmp = svm_range_unmap_from_gpus(pchild, s, l,
+								  prange->bitmap_mapped,
+								 trigger);
+				if (r_tmp && !r)
+					r = r_tmp;
+			}
 			mutex_unlock(&pchild->lock);
 		}
 		s = max(start, prange->start);
 		l = min(last, prange->last);
-		if (l >= s)
-			svm_range_unmap_from_gpus(prange, s, l, prange->bitmap_mapped, trigger);
+		if (l >= s) {
+			r_tmp = svm_range_unmap_from_gpus(prange, s, l,
+							  prange->bitmap_mapped, trigger);
+			if (r_tmp && !r)
+				r = r_tmp;
+		}
 	}
 
 	return r;
@@ -2396,22 +2568,38 @@ svm_range_update_notifier_and_interval_tree(struct mm_struct *mm,
 	svm_range_add_notifier_locked(mm, prange);
 }
 
-static void
+static int
 svm_range_handle_list_op(struct svm_range_list *svms, struct svm_range *prange,
-			 struct mm_struct *mm)
+			 struct mm_struct *mm, bool unmap_done)
 {
+	int ret = 0;
+
 	switch (prange->work_item.op) {
 	case SVM_OP_NULL:
 		pr_debug("NULL OP 0x%p prange 0x%p [0x%lx 0x%lx]\n",
 			 svms, prange, prange->start, prange->last);
 		break;
 	case SVM_OP_UNMAP_RANGE:
+	{
+		int r;
+
 		pr_debug("remove 0x%p prange 0x%p [0x%lx 0x%lx]\n",
 			 svms, prange, prange->start, prange->last);
+		r = unmap_done ? 0 :
+			svm_range_unmap_from_gpus(prange, prange->start,
+						  prange->last,
+						  prange->bitmap_mapped,
+						  KFD_SVM_UNMAP_TRIGGER_UNMAP_FROM_CPU);
+		if (r || !bitmap_empty(prange->bitmap_mapped, MAX_GPU_INSTANCE)) {
+			pr_err("retain SVM [%lx, %lx] after GPU unmap error %d\n",
+			       prange->start, prange->last, r);
+			return r ? r : -EIO;
+		}
 		svm_range_unlink(prange);
 		svm_range_remove_notifier(prange);
 		svm_range_free(prange, true);
-		break;
+		return 0;
+	}
 	case SVM_OP_UPDATE_RANGE_NOTIFIER:
 		pr_debug("update notifier 0x%p prange 0x%p [0x%lx 0x%lx]\n",
 			 svms, prange, prange->start, prange->last);
@@ -2439,7 +2627,10 @@ svm_range_handle_list_op(struct svm_range_list *svms, struct svm_range *prange,
 	default:
 		WARN_ONCE(1, "Unknown prange 0x%p work op %d\n", prange,
 			 prange->work_item.op);
+		ret = -EINVAL;
 	}
+
+	return ret;
 }
 
 static void svm_range_drain_retry_fault(struct svm_range_list *svms)
@@ -2480,6 +2671,7 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 	struct svm_range_list *svms;
 	struct svm_range *prange;
 	struct mm_struct *mm;
+	int ret;
 
 	svms = container_of(work, struct svm_range_list, deferred_list_work);
 	pr_debug("enter svms 0x%p\n", svms);
@@ -2511,21 +2703,55 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 
 		mutex_lock(&svms->lock);
 		mutex_lock(&prange->migrate_mutex);
+		ret = 0;
 		while (!list_empty(&prange->child_list)) {
 			struct svm_range *pchild;
+			int r = 0;
 
 			pchild = list_first_entry(&prange->child_list,
 						struct svm_range, child_list);
 			pr_debug("child prange 0x%p op %d\n", pchild,
 				 pchild->work_item.op);
+			if (pchild->work_item.op == SVM_OP_UNMAP_RANGE) {
+				r = svm_range_unmap_from_gpus(pchild, pchild->start,
+							      pchild->last,
+							      pchild->bitmap_mapped,
+							      KFD_SVM_UNMAP_TRIGGER_UNMAP_FROM_CPU);
+				if (r || !bitmap_empty(pchild->bitmap_mapped,
+						       MAX_GPU_INSTANCE)) {
+					pr_err("retain child SVM [%lx, %lx] after unmap error %d\n",
+					       pchild->start, pchild->last, r);
+					ret = r ? r : -EIO;
+					break;
+				}
+			}
 			list_del_init(&pchild->child_list);
-			svm_range_handle_list_op(svms, pchild, mm);
+			r = svm_range_handle_list_op(svms, pchild, mm,
+						     pchild->work_item.op ==
+						     SVM_OP_UNMAP_RANGE);
+			if (r) {
+				ret = r;
+				break;
+			}
 		}
 		mutex_unlock(&prange->migrate_mutex);
 
-		svm_range_handle_list_op(svms, prange, mm);
+		/* Keep the parent and its children linked if any child drain failed. */
+		if (!ret && list_empty(&prange->child_list))
+			ret = svm_range_handle_list_op(svms, prange, mm, false);
 		mutex_unlock(&svms->lock);
 		mmap_write_unlock(mm);
+
+		/* A deferred unmap is still an owner of the range until the GPU
+		 * confirms it. Requeue with backoff so a transient failure cannot
+		 * strand the mapped range until process exit.
+		 */
+		if (ret) {
+			msleep(100);
+			svm_range_add_list_work(svms, prange, mm,
+						SVM_OP_UNMAP_RANGE);
+			schedule_deferred_list_work(svms);
+		}
 
 		/* Pairs with mmget in svm_range_add_list_work. If dropping the
 		 * last mm refcount, schedule release work to avoid circular locking
@@ -2607,30 +2833,20 @@ svm_range_unmap_split(struct svm_range *parent, struct svm_range *prange, unsign
 	}
 }
 
-static void
+static int
 svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 			 unsigned long start, unsigned long last)
 {
 	uint32_t trigger = KFD_SVM_UNMAP_TRIGGER_UNMAP_FROM_CPU;
 	struct svm_range_list *svms;
 	struct svm_range *pchild;
-	struct kfd_process *p;
+	/* The interval notifier pins this range until remove() drains callbacks. */
+	struct kfd_process *p = container_of(prange->svms,
+					     struct kfd_process, svms);
 	unsigned long s, l;
 	bool unmap_parent;
+	int ret = 0;
 
-	if (atomic_read(&prange->queue_refcount)) {
-		int r;
-
-		pr_warn("Freeing queue vital buffer 0x%lx, queue evicted\n",
-			prange->start << PAGE_SHIFT);
-		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
-		if (r)
-			pr_debug("failed %d to quiesce KFD queues\n", r);
-	}
-
-	p = kfd_lookup_process_by_mm(mm);
-	if (!p)
-		return;
 	svms = &p->svms;
 
 	pr_debug("svms 0x%p prange 0x%p [0x%lx 0x%lx] [0x%lx 0x%lx]\n", svms,
@@ -2644,15 +2860,35 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 		mutex_lock_nested(&pchild->lock, 1);
 		s = max(start, pchild->start);
 		l = min(last, pchild->last);
-		if (l >= s)
-			svm_range_unmap_from_gpus(pchild, s, l, prange->bitmap_mapped, trigger);
-		svm_range_unmap_split(prange, pchild, start, last);
+		if (l >= s) {
+			int r = svm_range_unmap_from_gpus(pchild, s, l,
+							 prange->bitmap_mapped,
+							 trigger);
+
+			if (r && !ret)
+				ret = r;
+		}
 		mutex_unlock(&pchild->lock);
 	}
 	s = max(start, prange->start);
 	l = min(last, prange->last);
-	if (l >= s)
-		svm_range_unmap_from_gpus(prange, s, l, prange->bitmap_mapped, trigger);
+	if (l >= s) {
+		int r = svm_range_unmap_from_gpus(prange, s, l,
+							 prange->bitmap_mapped, trigger);
+
+		if (r && !ret)
+			ret = r;
+	}
+
+	/* Retry the callback synchronously; deferred work cannot satisfy MM's gate. */
+	if (ret)
+		return ret;
+
+	list_for_each_entry(pchild, &prange->child_list, child_list) {
+		mutex_lock_nested(&pchild->lock, 1);
+		svm_range_unmap_split(prange, pchild, start, last);
+		mutex_unlock(&pchild->lock);
+	}
 	svm_range_unmap_split(prange, prange, start, last);
 
 	if (unmap_parent)
@@ -2662,7 +2898,7 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 					SVM_OP_UPDATE_RANGE_NOTIFIER);
 	schedule_deferred_list_work(svms);
 
-	kfd_unref_process(p);
+	return 0;
 }
 
 /**
@@ -2691,11 +2927,17 @@ svm_range_cpu_invalidate_pagetables(struct mmu_interval_notifier *mni,
 				    unsigned long cur_seq)
 {
 	struct svm_range *prange;
+	struct kfd_process *p;
 	unsigned long start;
 	unsigned long last;
+	int r;
 
 	if (range->event == MMU_NOTIFY_RELEASE)
 		return true;
+
+	/* Locking and unmap/eviction below may sleep. Ask MM to retry first. */
+	if (!mmu_notifier_range_blockable(range))
+		return false;
 
 	start = mni->interval_tree.start;
 	last = mni->interval_tree.last;
@@ -2708,16 +2950,48 @@ svm_range_cpu_invalidate_pagetables(struct mmu_interval_notifier *mni,
 		 mni->interval_tree.last >> PAGE_SHIFT, range->event);
 
 	prange = container_of(mni, struct svm_range, notifier);
+	p = container_of(prange->svms, struct kfd_process, svms);
 
 	svm_range_lock(prange);
 	mmu_interval_set_seq(mni, cur_seq);
 
 	switch (range->event) {
 	case MMU_NOTIFY_UNMAP:
-		svm_range_unmap_from_cpu(mni->mm, prange, start, last);
+		/* Acquire the SVM eviction reference once for this callback. The
+		 * unmap retry below reuses that stopped state and must not acquire
+		 * another per-device reference on each attempt.
+		 */
+		if (atomic_read(&prange->queue_refcount)) {
+			do {
+				r = kfd_process_evict_queues(p, true,
+							     KFD_QUEUE_EVICTION_TRIGGER_SVM);
+				if (r) {
+					pr_err_ratelimited("SVM CPU-unmap queue drain failed %d; retrying before notifier return\n",
+							   r);
+					msleep(100);
+				}
+			} while (r);
+		}
+		do {
+			r = svm_range_unmap_from_cpu(mni->mm, prange,
+						     start, last);
+			if (r) {
+				pr_err_ratelimited("SVM CPU invalidation unmap failed %d; retrying before notifier return\n",
+						   r);
+				msleep(100);
+			}
+		} while (r);
 		break;
 	default:
-		svm_range_evict(prange, mni->mm, start, last, range->event);
+		do {
+			r = svm_range_evict(prange, mni->mm, start, last,
+					    range->event);
+			if (r) {
+				pr_err_ratelimited("SVM invalidation unmap failed %d; retrying before notifier return\n",
+						   r);
+				msleep(100);
+			}
+		} while (r);
 		break;
 	}
 
@@ -3362,10 +3636,13 @@ out_unlock:
 	return r;
 }
 
-void svm_range_list_fini(struct kfd_process *p)
+int svm_range_list_fini(struct kfd_process *p)
 {
 	struct svm_range *prange;
 	struct svm_range *next;
+	struct svm_range *pchild;
+	struct svm_range *child_next;
+	int ret = 0;
 
 	pr_debug("process pid %d svms 0x%p\n", p->lead_thread->pid,
 		 &p->svms);
@@ -3384,15 +3661,59 @@ void svm_range_list_fini(struct kfd_process *p)
 	svm_range_drain_retry_fault(&p->svms);
 
 	list_for_each_entry_safe(prange, next, &p->svms.list, list) {
-		svm_range_unlink(prange);
+		int r;
+
+		/* Removal waits for any interval callback before the final drain. */
 		svm_range_remove_notifier(prange);
+
+		list_for_each_entry_safe(pchild, child_next,
+					 &prange->child_list, child_list) {
+			svm_range_remove_notifier(pchild);
+			r = svm_range_unmap_from_gpus(pchild, pchild->start,
+						      pchild->last,
+						      pchild->bitmap_mapped,
+						      KFD_SVM_UNMAP_TRIGGER_UNMAP_FROM_CPU);
+			if (r || !bitmap_empty(pchild->bitmap_mapped,
+					       MAX_GPU_INSTANCE)) {
+				pr_err_ratelimited("retain SVM child [%lx, %lx] during process exit after unmap error %d\n",
+						   pchild->start, pchild->last, r);
+				if (!ret)
+					ret = r ? r : -EIO;
+				continue;
+			}
+			list_del_init(&pchild->child_list);
+			svm_range_free(pchild, true);
+		}
+
+		/* The parent must keep owning any child whose GPU drain failed. */
+		if (!list_empty(&prange->child_list))
+			continue;
+
+		r = svm_range_unmap_from_gpus(prange, prange->start,
+					      prange->last,
+					      prange->bitmap_mapped,
+					      KFD_SVM_UNMAP_TRIGGER_UNMAP_FROM_CPU);
+		if (r || !bitmap_empty(prange->bitmap_mapped,
+				       MAX_GPU_INSTANCE)) {
+			pr_err_ratelimited("retain SVM [%lx, %lx] during process exit after unmap error %d\n",
+					   prange->start, prange->last, r);
+			if (!ret)
+				ret = r ? r : -EIO;
+			continue;
+		}
+
+		svm_range_unlink(prange);
 		svm_range_free(prange, true);
 	}
+
+	if (ret)
+		return ret;
 
 	mutex_destroy(&p->svms.lock);
 
 	pr_debug("process pid %d svms 0x%p done\n",
 		p->lead_thread->pid, &p->svms);
+	return 0;
 }
 
 int svm_range_list_init(struct kfd_process *p)

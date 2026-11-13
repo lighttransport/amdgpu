@@ -77,6 +77,8 @@ int init_queue(struct queue **q, const struct queue_properties *properties)
 		return -ENOMEM;
 
 	memcpy(&tmp_q->properties, properties, sizeof(*properties));
+	/* Newly allocated queues have never been submitted to MES. */
+	tmp_q->mes_queue_removed = true;
 
 	*q = tmp_q;
 	return 0;

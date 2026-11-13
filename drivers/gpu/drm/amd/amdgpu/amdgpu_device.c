@@ -4632,7 +4632,7 @@ int amdgpu_device_suspend(struct drm_device *dev, bool notify_clients)
 	amdgpu_amdkfd_suspend(adev, !amdgpu_sriov_vf(adev) && !adev->in_runpm);
 	r = amdgpu_userq_suspend(adev);
 	if (r)
-		goto unwind_ip_phase1;
+		goto unwind_userq;
 
 	r = amdgpu_device_evict_resources(adev);
 	if (r)
@@ -4667,7 +4667,6 @@ unwind_userq:
 		return r;
 	}
 
-unwind_ip_phase1:
 	/* suspend phase 1 = resume phase 3 */
 	rec = amdgpu_device_ip_resume_phase3(adev);
 	if (rec) {
@@ -5361,22 +5360,20 @@ int amdgpu_do_asic_reset(struct list_head *device_list_handle,
 				dev_err(tmp_adev->dev,
 					"ASIC reset failed with error, %d for drm dev, %s",
 					r, adev_to_drm(tmp_adev)->unique);
-				goto out;
+				break;
 			}
 		}
 
-		/* For XGMI wait for all resets to complete before proceed */
-		if (!r) {
-			list_for_each_entry(tmp_adev, device_list_handle,
-					    reset_list) {
-				if (tmp_adev->gmc.xgmi.num_physical_nodes > 1) {
-					flush_work(&tmp_adev->xgmi_reset_work);
+		/* Join every XGMI worker, including after a submit/reset error. */
+		list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
+			if (tmp_adev->gmc.xgmi.num_physical_nodes > 1) {
+				flush_work(&tmp_adev->xgmi_reset_work);
+				if (!r)
 					r = tmp_adev->asic_reset_res;
-					if (r)
-						break;
-				}
 			}
 		}
+		if (r)
+			goto out;
 	}
 
 	if (!r && amdgpu_ras_intr_triggered()) {
@@ -5638,6 +5635,7 @@ static int amdgpu_device_asic_reset(struct amdgpu_device *adev,
 
 retry:	/* Rest of adevs pre asic reset from XGMI hive. */
 	list_for_each_entry(tmp_adev, device_list, reset_list) {
+		tmp_adev->asic_reset_res = 0;
 		r = amdgpu_device_pre_asic_reset(tmp_adev, reset_context);
 		/*TODO Should we stop ?*/
 		if (r) {
@@ -5670,7 +5668,7 @@ retry:	/* Rest of adevs pre asic reset from XGMI hive. */
 			adev->asic_reset_res = r;
 	} else {
 		r = amdgpu_do_asic_reset(device_list, reset_context);
-		if (r && r == -EAGAIN)
+		if (r == -EAGAIN && retry_limit-- > 0)
 			goto retry;
 	}
 
@@ -5696,25 +5694,9 @@ static int amdgpu_device_sched_resume(struct list_head *device_list,
 
 	/* Post ASIC reset for all devs .*/
 	list_for_each_entry(tmp_adev, device_list, reset_list) {
-
-		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
-			struct amdgpu_ring *ring = tmp_adev->rings[i];
-
-			if (!amdgpu_ring_sched_ready(ring))
-				continue;
-
-			drm_sched_wqueue_start(&ring->sched);
-		}
-
-		if (!drm_drv_uses_atomic_modeset(adev_to_drm(tmp_adev)) && !job_signaled)
-			drm_helper_resume_force_mode(adev_to_drm(tmp_adev));
-
 		if (tmp_adev->asic_reset_res) {
-			/* bad news, how to tell it to userspace ?
-			 * for ras error, we should report GPU bad status instead of
-			 * reset failure
-			 */
-			if (reset_context->src != AMDGPU_RESET_SRC_RAS ||
+			/* PCI recovery has no reset context. */
+			if (!reset_context || reset_context->src != AMDGPU_RESET_SRC_RAS ||
 			    !amdgpu_ras_eeprom_check_err_threshold(tmp_adev))
 				dev_info(
 					tmp_adev->dev,
@@ -5727,23 +5709,37 @@ static int amdgpu_device_sched_resume(struct list_head *device_list,
 					    tmp_adev->asic_reset_res);
 			if (!r)
 				r = tmp_adev->asic_reset_res;
-			tmp_adev->asic_reset_res = 0;
-		} else {
-			dev_info(tmp_adev->dev, "GPU reset(%d) succeeded!\n",
-				 atomic_read(&tmp_adev->gpu_reset_counter));
-			if (amdgpu_acpi_smart_shift_update(tmp_adev,
-							   AMDGPU_SS_DEV_D0))
-				dev_warn(tmp_adev->dev,
-					 "smart shift update failed\n");
 		}
+	}
+	if (r)
+		return r;
+
+	list_for_each_entry(tmp_adev, device_list, reset_list) {
+		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+			struct amdgpu_ring *ring = tmp_adev->rings[i];
+
+			if (!amdgpu_ring_sched_ready(ring))
+				continue;
+
+			drm_sched_wqueue_start(&ring->sched);
+		}
+
+		if (!drm_drv_uses_atomic_modeset(adev_to_drm(tmp_adev)) && !job_signaled)
+			drm_helper_resume_force_mode(adev_to_drm(tmp_adev));
+
+		dev_info(tmp_adev->dev, "GPU reset(%d) succeeded!\n",
+			 atomic_read(&tmp_adev->gpu_reset_counter));
+		if (amdgpu_acpi_smart_shift_update(tmp_adev,
+						   AMDGPU_SS_DEV_D0))
+			dev_warn(tmp_adev->dev,
+				 "smart shift update failed\n");
 	}
 
 	return r;
 }
 
-static void amdgpu_device_gpu_resume(struct amdgpu_device *adev,
-			      struct list_head *device_list,
-			      bool   need_emergency_restart)
+static void amdgpu_device_gpu_resume(struct list_head *device_list,
+				     bool need_emergency_restart)
 {
 	struct amdgpu_device *tmp_adev = NULL;
 
@@ -5755,8 +5751,8 @@ static void amdgpu_device_gpu_resume(struct amdgpu_device *adev,
 		/* kfd_post_reset will do nothing if kfd device is not initialized,
 		 * need to bring up kfd here if it's not be initialized before
 		 */
-		if (!adev->kfd.init_complete)
-			amdgpu_amdkfd_device_init(adev);
+		if (!tmp_adev->kfd.init_complete)
+			amdgpu_amdkfd_device_init(tmp_adev);
 
 		if (tmp_adev->pcie_reset_ctx.audio_suspended)
 			amdgpu_device_resume_display_audio(tmp_adev);
@@ -5883,7 +5879,7 @@ skip_hw_reset:
 	if (r)
 		goto reset_unlock;
 skip_sched_resume:
-	amdgpu_device_gpu_resume(adev, &device_list, need_emergency_restart);
+	amdgpu_device_gpu_resume(&device_list, need_emergency_restart);
 reset_unlock:
 	amdgpu_device_recovery_put_reset_lock(adev, &device_list);
 	amdgpu_ras_post_reset(adev, &device_list);
@@ -6370,7 +6366,7 @@ pci_ers_result_t amdgpu_pci_slot_reset(struct pci_dev *pdev)
 	struct list_head device_list;
 	struct pci_dev *link_dev;
 	int r = 0, i, timeout;
-	u32 memsize;
+	u32 memsize = 0xffffffff;
 	u16 status;
 
 	dev_info(adev->dev, "PCI error: slot reset callback!!\n");
@@ -6394,13 +6390,15 @@ pci_ers_result_t amdgpu_pci_slot_reset(struct pci_dev *pdev)
 	timeout = 10000;
 	do {
 		usleep_range(10000, 10500);
+		status = 0xffff;
 		r = pci_read_config_word(link_dev, PCI_VENDOR_ID, &status);
 		timeout -= 10;
-	} while (timeout > 0 && (status != PCI_VENDOR_ID_ATI) &&
-		 (status != PCI_VENDOR_ID_AMD));
+	} while (timeout > 0 &&
+		 (r || (status != PCI_VENDOR_ID_ATI && status != PCI_VENDOR_ID_AMD)));
 
-	if ((status != PCI_VENDOR_ID_ATI) && (status != PCI_VENDOR_ID_AMD)) {
-		r = -ETIME;
+	if (r || (status != PCI_VENDOR_ID_ATI && status != PCI_VENDOR_ID_AMD)) {
+		if (!r)
+			r = -ETIME;
 		goto out;
 	}
 
@@ -6472,6 +6470,7 @@ void amdgpu_pci_resume(struct pci_dev *pdev)
 	struct list_head device_list;
 	struct amdgpu_hive_info *hive = NULL;
 	struct amdgpu_device *tmp_adev = NULL;
+	int r;
 
 	dev_info(adev->dev, "PCI error: resume callback!!\n");
 
@@ -6492,8 +6491,11 @@ void amdgpu_pci_resume(struct pci_dev *pdev)
 		adev->pcie_reset_ctx.in_link_reset = false;
 		list_add_tail(&adev->reset_list, &device_list);
 	}
-	amdgpu_device_sched_resume(&device_list, NULL, NULL);
-	amdgpu_device_gpu_resume(adev, &device_list, false);
+	r = amdgpu_device_sched_resume(&device_list, NULL, false);
+	if (r)
+		dev_err(adev->dev, "PCI recovery resume failed: %d\n", r);
+	else
+		amdgpu_device_gpu_resume(&device_list, false);
 	amdgpu_device_recovery_put_reset_lock(adev, &device_list);
 
 	if (hive) {

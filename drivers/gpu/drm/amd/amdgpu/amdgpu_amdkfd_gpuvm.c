@@ -438,7 +438,7 @@ static int amdgpu_amdkfd_bo_validate(struct amdgpu_bo *bo, uint32_t domain,
 	if (ret)
 		goto validate_fail;
 	if (wait)
-		amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+		ret = amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
 
 validate_fail:
 	return ret;
@@ -1623,14 +1623,20 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 	}
 
 	ret = amdgpu_bo_pin(bo, domain);
-	if (ret)
+	if (ret) {
 		pr_err("Error in Pinning BO to domain: %d\n", domain);
+		goto out;
+	}
 
-	amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+	ret = amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+	if (ret) {
+		amdgpu_bo_unpin(bo);
+		goto out;
+	}
 
-	if (!ret && bo->tbo.resource->mem_type == TTM_PL_VRAM)
-                atomic64_add(amdgpu_bo_size(bo),
-                        &amdgpu_ttm_adev(bo->tbo.bdev)->kfd.vram_pinned);
+	if (bo->tbo.resource->mem_type == TTM_PL_VRAM)
+		atomic64_add(amdgpu_bo_size(bo),
+			     &amdgpu_ttm_adev(bo->tbo.bdev)->kfd.vram_pinned);
 
 out:
 	amdgpu_bo_unreserve(bo);
@@ -3132,7 +3138,7 @@ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
 	struct amdgpu_vm *peer_vm;
 	struct kgd_mem *mem, *tmp_mem;
 	struct amdgpu_bo *bo;
-	int ret;
+	int ret, wait_ret;
 
 	amdgpu_sync_create(&sync);
 
@@ -3234,7 +3240,9 @@ static int validate_invalid_user_pages(struct amdkfd_process_info *process_info)
 
 unreserve_out:
 	drm_exec_fini(&exec);
-	amdgpu_sync_wait(&sync, false);
+	wait_ret = amdgpu_sync_wait(&sync, false);
+	if (!ret)
+		ret = wait_ret;
 	amdgpu_sync_free(&sync);
 
 	return ret;
@@ -3344,7 +3352,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
 
 	process_info->evicted_bos = evicted_bos = 0;
 
-	if (kgd2kfd_resume_mm(mm)) {
+	if (kgd2kfd_resume_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_USERPTR)) {
 		pr_err("%s: Failed to resume KFD\n", __func__);
 		/* No recovery from this failure. Probably the CP is
 		 * hanging. No point trying again.
@@ -3554,8 +3562,10 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence __rcu *
 		goto validate_map_fail;
 	}
 
-	/* Wait for validate and PT updates to finish */
-	amdgpu_sync_wait(&sync_obj, false);
+	/* Wait for validate and PT updates before publishing a new fence. */
+	ret = amdgpu_sync_wait(&sync_obj, false);
+	if (ret)
+		goto validate_map_fail;
 
 	/* The old eviction fence may be unsignaled if restore happens
 	 * after a GPU reset or suspend/resume. Keep the old fence in that

@@ -183,6 +183,17 @@ struct device_queue_manager_ops {
 	int (*restore_process_queues)(struct device_queue_manager *dqm,
 				      struct qcm_process_device *qpd);
 
+	/* Outcomes describe actual counter changes, independently of errno. */
+	int (*evict_process_queues_ref)(struct device_queue_manager *dqm,
+					struct qcm_process_device *qpd,
+					enum kfd_eviction_owner owner,
+					bool *acquired,
+					bool retry);
+	int (*restore_process_queues_ref)(struct device_queue_manager *dqm,
+					  struct qcm_process_device *qpd,
+					  enum kfd_eviction_owner owner,
+					  bool *consumed);
+
 	int	(*get_wave_state)(struct device_queue_manager *dqm,
 				  struct queue *q,
 				  void __user *ctl_stack,
@@ -287,9 +298,6 @@ struct device_queue_manager {
 	struct dqm_detect_hang_info *detect_hang_info;
 	size_t detect_hang_info_size;
 	int detect_hang_count;
-	/* for per-queue reset with mes */
-	u32 *hung_db_array;
-	struct amdgpu_mes_hung_queue_hqd_info *hqd_info;
 };
 
 void device_queue_manager_init_cik(

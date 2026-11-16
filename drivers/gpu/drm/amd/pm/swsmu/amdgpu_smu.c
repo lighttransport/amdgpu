@@ -1046,6 +1046,18 @@ static int smu_late_init(struct amdgpu_ip_block *ip_block)
 		smu_restore_ppt_limits(smu, false);
 	smu_restore_dpm_user_profile(smu);
 
+	/*
+	 * A GPU reset also drops PMFW soft limits, but the user profile is
+	 * restored only on resume and the level is reapplied only when it
+	 * changes, so reapply a user GFX clock cap here.
+	 */
+	if (amdgpu_reset_in_recovery(adev) && !adev->in_suspend &&
+	    smu->user_dpm_profile.gfx_clk_max) {
+		ret = smu_asic_set_performance_level(smu, smu->smu_dpm.dpm_level);
+		if (ret)
+			dev_err(adev->dev, "Failed to restore GFX clock cap after reset\n");
+	}
+
 	return 0;
 }
 

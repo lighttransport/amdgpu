@@ -2547,20 +2547,21 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 		if (size == 2 && input[0] == 1) {
 			struct smu_14_0_dpm_context *dpm_context = smu->smu_dpm.dpm_context;
 			struct smu_dpm_table *gfx_table = &dpm_context->dpm_tables.gfx_table;
-			uint32_t cap = input[1];
+			uint32_t cap;
 
 			/*
 			 * "s 1 <MHz>" caps the GFX clock through the PMFW soft
 			 * maximum, within the SKU's DPM range; "s 1 0" removes
 			 * the cap.  The PPT limit is unchanged.
 			 */
-			if (cap && (input[1] < SMU_DPM_TABLE_MIN(gfx_table) ||
-				    input[1] > SMU_DPM_TABLE_MAX(gfx_table))) {
+			if (input[1] && (input[1] < SMU_DPM_TABLE_MIN(gfx_table) ||
+					 input[1] > SMU_DPM_TABLE_MAX(gfx_table))) {
 				dev_info(adev->dev, "GFX clock cap must be 0 or within [%u, %u]!\n",
 					 SMU_DPM_TABLE_MIN(gfx_table),
 					 SMU_DPM_TABLE_MAX(gfx_table));
 				return -EINVAL;
 			}
+			cap = input[1];
 			return smu_v14_0_2_set_gfx_clk_max(smu, cap);
 		}
 
@@ -2817,7 +2818,7 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 		break;
 
 	case PP_OD_RESTORE_DEFAULT_TABLE:
-		if (smu->user_dpm_profile.gfx_clk_max) {
+		if (size != 1 && smu->user_dpm_profile.gfx_clk_max) {
 			ret = smu_v14_0_2_set_gfx_clk_max(smu, 0);
 			if (ret)
 				return ret;
@@ -2856,16 +2857,20 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 
 			od_table->OverDriveTable.FeatureCtrlMask = 0;
 
+			/* The PMFW holds this table now; record it before the cap. */
+			memcpy(table_context->user_overdrive_table + offset_of_voltageoffset,
+			       (u8 *)od_table + offset_of_voltageoffset,
+			       sizeof(OverDriveTableExternal_t) - offset_of_voltageoffset);
+
 			/* Keep a user GFX clock cap across OD table uploads. */
 			if (smu->user_dpm_profile.gfx_clk_max) {
 				ret = smu_v14_0_set_performance_level(smu,
 								      smu->smu_dpm.dpm_level);
 				if (ret)
-					return ret;
+					dev_err(adev->dev,
+						"OD table committed, but GFX clock cap reapply failed (%d)\n",
+						ret);
 			}
-			memcpy(table_context->user_overdrive_table + offset_of_voltageoffset,
-			       (u8 *)od_table + offset_of_voltageoffset,
-			       sizeof(OverDriveTableExternal_t) - offset_of_voltageoffset);
 
 			if (!memcmp(table_context->user_overdrive_table,
 				    table_context->boot_overdrive_table,

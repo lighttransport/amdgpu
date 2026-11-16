@@ -1185,6 +1185,10 @@ int smu_v14_0_set_performance_level(struct smu_context *smu,
 		 */
 		if (!smu->user_dpm_profile.gfx_clk_max)
 			return 0;
+		/* Re-force user sclk levels (capped there) rather than drop their minimum. */
+		if (smu->user_dpm_profile.clk_mask[SMU_SCLK] && smu->ppt_funcs->force_clk_levels)
+			return smu->ppt_funcs->force_clk_levels(smu, SMU_SCLK,
+					smu->user_dpm_profile.clk_mask[SMU_SCLK]);
 		ret = smu_v14_0_set_soft_freq_limited_range(smu, SMU_GFXCLK, 0,
 							    smu->user_dpm_profile.gfx_clk_max,
 							    false);
@@ -1214,6 +1218,14 @@ int smu_v14_0_set_performance_level(struct smu_context *smu,
 			pstate_table->gfxclk_pstate.curr.max = sclk_max;
 			sclk_min = sclk_max = 0;
 		}
+	} else if (smu->user_dpm_profile.gfx_clk_max && !sclk_max && !auto_level) {
+		/* Levels that leave GFXCLK alone (e.g. PROFILE_MIN_MCLK) stay capped. */
+		ret = smu_v14_0_set_soft_freq_limited_range(smu, SMU_GFXCLK, 0,
+							    smu->user_dpm_profile.gfx_clk_max,
+							    false);
+		if (ret)
+			return ret;
+		pstate_table->gfxclk_pstate.curr.max = smu->user_dpm_profile.gfx_clk_max;
 	}
 
 	if (sclk_min && sclk_max) {

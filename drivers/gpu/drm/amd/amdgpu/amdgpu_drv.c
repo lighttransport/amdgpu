@@ -814,6 +814,20 @@ MODULE_PARM_DESC(kfd_queue_priority_cap,
 	"Max HSA priority for KFD user queues; 0-6 = low CP pipe priority so graphics stays responsive under compute load (-1 = no cap (default), 0-15)");
 
 /**
+ * DOC: kfd_gfx_reserved_cus (int)
+ * Number of CUs that KFD compute queues without an application CU mask
+ * leave free for graphics, so a compute load that fills every CU (e.g. a
+ * miner) cannot starve the compositor into a gfx ring timeout. Rounded up to
+ * whole WGPs and spread across shader arrays; at least one WGP stays
+ * available to compute. 0 (default) disables it. GFX 12.0 only. Read at
+ * module load.
+ */
+int kfd_gfx_reserved_cus;
+module_param(kfd_gfx_reserved_cus, int, 0444);
+MODULE_PARM_DESC(kfd_gfx_reserved_cus,
+	"CUs kept free of KFD compute queues for graphics (0 = off (default); GFX 12.0; rounded to WGPs)");
+
+/**
  * DOC: cwsr_enable (int)
  * CWSR(compute wave store and resume) allows the GPU to preempt shader execution in
  * the middle of a compute wave. Default is 1 to enable this feature. Setting 0

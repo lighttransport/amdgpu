@@ -188,6 +188,9 @@ extern int sched_policy;
  */
 extern int hws_max_conc_proc;
 
+/* CUs left free of default-masked KFD compute queues (amdgpu.kfd_gfx_reserved_cus). */
+extern int kfd_gfx_reserved_cus;
+
 /* Optional cap on KFD user queue priority (amdgpu.kfd_queue_priority_cap). */
 extern int kfd_queue_priority_cap;
 

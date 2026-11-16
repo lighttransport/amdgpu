@@ -97,6 +97,39 @@ void free_mqd_hiq_sdma(struct mqd_manager *mm, void *mqd,
 	kfree(mqd_mem_obj);
 }
 
+/*
+ * Build the default CU mask that leaves kfd_gfx_reserved_cus CUs free for
+ * graphics. Returns the mask bit count (a multiple of 32) or 0 when no
+ * reservation applies. The reservation is rounded up to whole WGPs and at
+ * least one WGP stays enabled, so the mask is never empty. Clearing the top
+ * bits removes the last WGPs of the round-robin SE/SH mapping, spreading
+ * the reserved CUs across shader arrays.
+ */
+uint32_t mqd_gfx_reserved_cu_mask(struct mqd_manager *mm, uint32_t *cu_mask,
+				  uint32_t words)
+{
+	uint32_t unit = KFD_GC_VERSION(mm->dev) >= IP_VERSION(10, 0, 0) ? 2 : 1;
+	uint32_t active, reserved, keep, count, i;
+	int param = READ_ONCE(kfd_gfx_reserved_cus);
+
+	if (param <= 0 || !mm->dev->kfd->num_nodes)
+		return 0;
+	active = mm->dev->adev->gfx.cu_info.number / mm->dev->kfd->num_nodes;
+	count = ALIGN(active, 32);
+	if (active < 2 * unit || count > words * 32)
+		return 0;
+
+	reserved = min_t(uint32_t, roundup((uint32_t)param, unit), active - unit);
+	keep = rounddown(active - reserved, unit);
+	if (!keep)
+		return 0;
+
+	memset(cu_mask, 0, words * sizeof(*cu_mask));
+	for (i = 0; i < keep; i++)
+		cu_mask[i / 32] |= 1u << (i % 32);
+	return count;
+}
+
 void mqd_symmetrically_map_cu_mask(struct mqd_manager *mm,
 		const uint32_t *cu_mask, uint32_t cu_mask_count,
 		uint32_t *se_mask, uint32_t inst)

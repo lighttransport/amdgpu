@@ -79,6 +79,24 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
 		if (q->type != KFD_QUEUE_TYPE_COMPUTE ||
 		    q->is_user_cu_masked || q->is_dbg_wa)
 			return;
+		/*
+		 * Cooperative (GWS) queues size grids for every CU; a reduced
+		 * mask could leave grid-barrier workgroups unable to become
+		 * resident. Restore the full mask, which GWS may be enabled on
+		 * after the default reservation was applied.
+		 */
+		if (q->is_gws) {
+			m = get_mqd(mqd);
+			m->compute_static_thread_mgmt_se0 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se1 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se2 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se3 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se4 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se5 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se6 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se7 = 0xFFFFFFFF;
+			return;
+		}
 		count = mqd_gfx_reserved_cu_mask(mm, reserve_mask,
 						 ARRAY_SIZE(reserve_mask));
 		if (!count)

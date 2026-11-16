@@ -1189,13 +1189,18 @@ int pqm_update_mqd(struct process_queue_manager *pqm,
 		}
 	}
 
+	/*
+	 * Record the user mask before the update: update_queue can fail after
+	 * the MQD already holds it, and later mask-less updates must not then
+	 * replace it with the default graphics reservation.
+	 */
+	if (minfo && minfo->cu_mask.ptr)
+		pqn->q->properties.is_user_cu_masked = true;
+
 	retval = pqn->q->device->dqm->ops.update_queue(pqn->q->device->dqm,
 							pqn->q, minfo);
 	if (retval != 0)
 		return retval;
-
-	if (minfo && minfo->cu_mask.ptr)
-		pqn->q->properties.is_user_cu_masked = true;
 
 	return 0;
 }

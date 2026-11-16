@@ -110,14 +110,18 @@ uint32_t mqd_gfx_reserved_cu_mask(struct mqd_manager *mm, uint32_t *cu_mask,
 {
 	uint32_t unit = KFD_GC_VERSION(mm->dev) >= IP_VERSION(10, 0, 0) ? 2 : 1;
 	uint32_t active, reserved, keep, count, i;
-	int param = READ_ONCE(kfd_gfx_reserved_cus);
+	int param = kfd_gfx_reserved_cus;
 
 	if (param <= 0 || !mm->dev->kfd->num_nodes)
 		return 0;
 	active = mm->dev->adev->gfx.cu_info.number / mm->dev->kfd->num_nodes;
 	count = ALIGN(active, 32);
-	if (active < 2 * unit || count > words * 32)
+	if (active < 2 * unit || count > words * 32) {
+		dev_warn_once(mm->dev->adev->dev,
+			      "kfd_gfx_reserved_cus=%d not applied (%u active CUs)\n",
+			      param, active);
 		return 0;
+	}
 
 	reserved = min_t(uint32_t, roundup((uint32_t)param, unit), active - unit);
 	keep = rounddown(active - reserved, unit);

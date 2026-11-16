@@ -349,11 +349,14 @@ static int remove_queue_mes_on_reset_option(struct device_queue_manager *dqm, st
 	 * out and escalate into another full reset; treat it as drained.
 	 */
 	if (q->mes_fw_gen != (u32)atomic_read(&adev->mes.fw_generation)) {
+		struct kfd_process_device *pdd = qpd_to_pdd(qpd);
+
 		up_read(&adev->reset_domain->sem);
 		dev_info_ratelimited(adev->dev,
-			"MES queue %u doorbell=0x%x predates MES reinit (gen %u != %u), skipping REMOVE_QUEUE\n",
-			q->properties.queue_id, q->properties.doorbell_off,
-			q->mes_fw_gen, (u32)atomic_read(&adev->mes.fw_generation));
+			"MES queue predates MES reinit (gen %u != %u), skipping REMOVE_QUEUE: pid=%d pasid=%u queue=%u doorbell=0x%x\n",
+			q->mes_fw_gen, (u32)atomic_read(&adev->mes.fw_generation),
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
 		q->mes_queue_removed = true;
 		return 0;
 	}

@@ -43,6 +43,7 @@
 #include "amdgpu.h"
 #include "amdgpu_sandbox.h"
 #include "amdgpu_lte_debug.h"
+#include <uapi/linux/kfd_ioctl.h>
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_drv.h"
@@ -783,7 +784,32 @@ MODULE_PARM_DESC(hws_max_conc_proc,
  * the cap. Writable at runtime; it applies to queues created or updated later.
  */
 int kfd_queue_priority_cap = -1;
-module_param(kfd_queue_priority_cap, int, 0644);
+
+static int kfd_queue_priority_cap_set(const char *val, const struct kernel_param *kp)
+{
+	int cap, r;
+
+	/*
+	 * -1 disables the cap; otherwise an HSA priority up to
+	 * KFD_MAX_QUEUE_PRIORITY.  Never fail: a bad modprobe.d value must not
+	 * keep amdgpu (and the display) from loading, so fall back to "off".
+	 */
+	r = kstrtoint(val, 0, &cap);
+	if (r || cap < -1 || cap > KFD_MAX_QUEUE_PRIORITY) {
+		pr_warn("amdgpu: invalid kfd_queue_priority_cap '%s' (-1..%d); cap disabled\n",
+			val, KFD_MAX_QUEUE_PRIORITY);
+		cap = -1;
+	}
+	WRITE_ONCE(*(int *)kp->arg, cap);
+	return 0;
+}
+
+static const struct kernel_param_ops kfd_queue_priority_cap_ops = {
+	.set = kfd_queue_priority_cap_set,
+	.get = param_get_int,
+};
+module_param_cb(kfd_queue_priority_cap, &kfd_queue_priority_cap_ops,
+		&kfd_queue_priority_cap, 0644);
 MODULE_PARM_DESC(kfd_queue_priority_cap,
 	"Max HSA priority for KFD user queues; 0-6 = low CP pipe priority so graphics stays responsive under compute load (-1 = no cap (default), 0-15)");
 

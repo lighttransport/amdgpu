@@ -1498,7 +1498,7 @@ static void set_queue_properties_from_criu(struct queue_properties *qp,
 {
 	qp->is_interop = false;
 	qp->queue_percent = q_data->q_percent;
-	qp->priority = q_data->priority;
+	qp->priority = kfd_cap_queue_priority(q_data->priority);
 	qp->queue_address = q_data->q_address;
 	qp->queue_size = q_data->q_size;
 	qp->read_ptr = (void __user *)q_data->read_ptr_addr;
@@ -1555,6 +1555,13 @@ int kfd_criu_restore_queue(struct kfd_process *p,
 	}
 
 	if (q_data->mqd_size != mqd_size_from_queue_type(pdd->dev->dqm, q_data->type)) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	/* Checkpoint data is user supplied; MQD setup indexes pipe_priority_map. */
+	if (q_data->priority > KFD_MAX_QUEUE_PRIORITY) {
+		pr_err("CRIU queue priority %u out of range\n", q_data->priority);
 		ret = -EINVAL;
 		goto exit;
 	}

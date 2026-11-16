@@ -188,6 +188,18 @@ extern int sched_policy;
  */
 extern int hws_max_conc_proc;
 
+/* Optional cap on KFD user queue priority (amdgpu.kfd_queue_priority_cap). */
+extern int kfd_queue_priority_cap;
+
+static inline uint32_t kfd_cap_queue_priority(uint32_t priority)
+{
+	int cap = READ_ONCE(kfd_queue_priority_cap);
+
+	if (cap >= 0 && cap <= KFD_MAX_QUEUE_PRIORITY && priority > (uint32_t)cap)
+		return cap;
+	return priority;
+}
+
 extern int cwsr_enable;
 
 /*

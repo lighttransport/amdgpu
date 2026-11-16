@@ -290,7 +290,7 @@ static int set_queue_properties_from_user(struct queue_properties *q_properties,
 	q_properties->queue_percent = args->queue_percentage & 0xFF;
 	/* bit 8-15 are repurposed to be PM4 target XCC */
 	q_properties->pm4_target_xcc = (args->queue_percentage >> 8) & 0xFF;
-	q_properties->priority = args->queue_priority;
+	q_properties->priority = kfd_cap_queue_priority(args->queue_priority);
 	q_properties->queue_address = args->ring_base_address;
 	q_properties->queue_size = args->ring_size;
 	if (args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE_AQL)
@@ -524,7 +524,7 @@ static int kfd_ioctl_update_queue(struct file *filp, struct kfd_process *p,
 	properties.queue_percent = args->queue_percentage & 0xFF;
 	/* bit 8-15 are repurposed to be PM4 target XCC */
 	properties.pm4_target_xcc = (args->queue_percentage >> 8) & 0xFF;
-	properties.priority = args->queue_priority;
+	properties.priority = kfd_cap_queue_priority(args->queue_priority);
 
 	pr_debug("Updating queue id %d for process pid %d\n",
 			args->queue_id, p->lead_thread->pid);

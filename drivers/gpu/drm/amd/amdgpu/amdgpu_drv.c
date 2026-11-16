@@ -775,6 +775,19 @@ MODULE_PARM_DESC(hws_max_conc_proc,
 	"Max # processes HWS can execute concurrently when sched_policy=0 (0 = no concurrency, #VMIDs for KFD = Maximum(default))");
 
 /**
+ * DOC: kfd_queue_priority_cap (int)
+ * Upper bound applied to the HSA priority (0-15) of KFD user queues when they
+ * are created or updated. Priorities 0-6 map to the low CP pipe priority, so a
+ * cap of 0 lets graphics work (compositor, cursor, page flips) win wave launch
+ * arbitration over long-running compute such as miners. -1 (default) disables
+ * the cap. Writable at runtime; it applies to queues created or updated later.
+ */
+int kfd_queue_priority_cap = -1;
+module_param(kfd_queue_priority_cap, int, 0644);
+MODULE_PARM_DESC(kfd_queue_priority_cap,
+	"Max HSA priority for KFD user queues; 0-6 = low CP pipe priority so graphics stays responsive under compute load (-1 = no cap (default), 0-15)");
+
+/**
  * DOC: cwsr_enable (int)
  * CWSR(compute wave store and resume) allows the GPU to preempt shader execution in
  * the middle of a compute wave. Default is 1 to enable this feature. Setting 0

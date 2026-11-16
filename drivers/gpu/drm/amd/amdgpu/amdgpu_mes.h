@@ -83,6 +83,12 @@ struct amdgpu_mes {
 
 	spinlock_t                      queue_id_lock;
 
+	/*
+	 * Advanced each time scheduler firmware is (re)initialized; queue
+	 * state recorded under an older generation no longer exists in MES.
+	 */
+	atomic_t			fw_generation;
+
 	uint32_t			sched_version;
 	uint32_t			kiq_version;
 	uint32_t			fw_version[AMDGPU_MAX_MES_PIPES];

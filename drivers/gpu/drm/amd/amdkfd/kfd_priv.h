@@ -729,6 +729,8 @@ struct queue {
 	struct queue_properties properties;
 	/* DQM-serialized: no MES submission since the last acknowledged removal. */
 	bool mes_queue_removed;
+	/* DQM-serialized: MES firmware generation of the last ADD_QUEUE. */
+	u32 mes_fw_gen;
 	/* DQM-serialized: a failed no-CP eviction still needs a confirmed drain. */
 	bool eviction_drain_pending;
 

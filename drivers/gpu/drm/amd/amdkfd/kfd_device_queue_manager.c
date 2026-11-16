@@ -310,6 +310,7 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 
 	/* A failed submission may still have reached firmware. */
 	q->mes_queue_removed = false;
+	q->mes_fw_gen = atomic_read(&adev->mes.fw_generation);
 	amdgpu_mes_lock(&adev->mes);
 	r = adev->mes.funcs->add_hw_queue(&adev->mes, &queue_input);
 	amdgpu_mes_unlock(&adev->mes);
@@ -341,6 +342,21 @@ static int remove_queue_mes_on_reset_option(struct device_queue_manager *dqm, st
 		return -EIO;
 	if (!down_read_trylock(&adev->reset_domain->sem))
 		return -EIO;
+
+	/*
+	 * MES was reinitialized (GPU reset or resume) since this queue was
+	 * added, so firmware holds no state for it.  REMOVE_QUEUE would time
+	 * out and escalate into another full reset; treat it as drained.
+	 */
+	if (q->mes_fw_gen != (u32)atomic_read(&adev->mes.fw_generation)) {
+		up_read(&adev->reset_domain->sem);
+		dev_info_ratelimited(adev->dev,
+			"MES queue %u doorbell=0x%x predates MES reinit (gen %u != %u), skipping REMOVE_QUEUE\n",
+			q->properties.queue_id, q->properties.doorbell_off,
+			q->mes_fw_gen, (u32)atomic_read(&adev->mes.fw_generation));
+		q->mes_queue_removed = true;
+		return 0;
+	}
 
 	memset(&queue_input, 0x0, sizeof(struct mes_remove_queue_input));
 	queue_input.doorbell_offset = q->properties.doorbell_off;

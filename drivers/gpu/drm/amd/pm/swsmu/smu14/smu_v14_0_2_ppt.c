@@ -1102,6 +1102,12 @@ static int smu_v14_0_2_emit_clk_levels(struct smu_context *smu,
 		size += sysfs_emit_at(buf, size, "OD_SCLK_OFFSET:\n");
 		size += sysfs_emit_at(buf, size, "%dMhz\n",
 					od_table->OverDriveTable.GfxclkFoffset);
+		size += sysfs_emit_at(buf, size, "OD_SCLK_MAX:\n");
+		if (smu->user_dpm_profile.gfx_clk_max)
+			size += sysfs_emit_at(buf, size, "%uMhz\n",
+					      smu->user_dpm_profile.gfx_clk_max);
+		else
+			size += sysfs_emit_at(buf, size, "auto\n");
 		break;
 
 	case SMU_OD_MCLK:
@@ -1259,6 +1265,9 @@ static int smu_v14_0_2_emit_clk_levels(struct smu_context *smu,
 							  &max_value);
 			size += sysfs_emit_at(buf, size, "SCLK_OFFSET: %7dMhz %10uMhz\n",
 					      min_value, max_value);
+			size += sysfs_emit_at(buf, size, "SCLK_MAX: %10uMhz %10uMhz\n",
+					      SMU_DPM_TABLE_MIN(&dpm_context->dpm_tables.gfx_table),
+					      SMU_DPM_TABLE_MAX(&dpm_context->dpm_tables.gfx_table));
 		}
 
 		if (smu_v14_0_2_is_od_feature_supported(smu, PP_OD_FEATURE_UCLK_BIT)) {
@@ -1369,6 +1378,13 @@ static int smu_v14_0_2_force_clk_levels(struct smu_context *smu,
 
 		min_freq = single_dpm_table->dpm_levels[soft_min_level].value;
 		max_freq = single_dpm_table->dpm_levels[soft_max_level].value;
+
+		/* A user GFX clock cap (OD "s 1 <MHz>") bounds forced levels too. */
+		if ((clk_type == SMU_GFXCLK || clk_type == SMU_SCLK) &&
+		    smu->user_dpm_profile.gfx_clk_max) {
+			max_freq = min(max_freq, smu->user_dpm_profile.gfx_clk_max);
+			min_freq = min(min_freq, max_freq);
+		}
 
 		ret = smu_v14_0_set_soft_freq_limited_range(smu,
 							    clk_type,
@@ -2476,6 +2492,37 @@ static int smu_v14_0_2_od_restore_table_single(struct smu_context *smu, long inp
 	return 0;
 }
 
+/*
+ * Set (cap > 0) or remove (cap == 0) the user GFX clock cap.  The cap is a
+ * PMFW soft maximum inside the SKU's DPM range; the PPT limit is unchanged.
+ */
+static int smu_v14_0_2_set_gfx_clk_max(struct smu_context *smu, uint32_t cap)
+{
+	struct smu_14_0_dpm_context *dpm_context = smu->smu_dpm.dpm_context;
+	struct smu_dpm_table *gfx_table = &dpm_context->dpm_tables.gfx_table;
+	uint32_t old = smu->user_dpm_profile.gfx_clk_max;
+	int ret;
+
+	smu->user_dpm_profile.gfx_clk_max = cap;
+	if (!cap && old) {
+		/* Manual levels keep soft limits, so lift the old cap here. */
+		ret = smu_v14_0_set_soft_freq_limited_range(smu, SMU_GFXCLK, 0,
+							    SMU_DPM_TABLE_MAX(gfx_table),
+							    false);
+		if (ret)
+			goto restore;
+	}
+	ret = smu_v14_0_set_performance_level(smu, smu->smu_dpm.dpm_level);
+	if (!ret)
+		return 0;
+restore:
+	/* Report only a cap the PMFW accepted; keep the previous one. */
+	smu->user_dpm_profile.gfx_clk_max = old;
+	dev_err(smu->adev->dev, "Failed to set GFX clock cap %u MHz (%d); keeping %u\n",
+		cap, ret, old);
+	return ret;
+}
+
 static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 					 enum PP_OD_DPM_TABLE_COMMAND type,
 					 long input[],
@@ -2495,6 +2542,26 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 		if (!smu_v14_0_2_is_od_feature_supported(smu, PP_OD_FEATURE_GFXCLK_BIT)) {
 			dev_warn(adev->dev, "GFXCLK_LIMITS setting not supported!\n");
 			return -ENOTSUPP;
+		}
+
+		if (size == 2 && input[0] == 1) {
+			struct smu_14_0_dpm_context *dpm_context = smu->smu_dpm.dpm_context;
+			struct smu_dpm_table *gfx_table = &dpm_context->dpm_tables.gfx_table;
+			uint32_t cap = input[1];
+
+			/*
+			 * "s 1 <MHz>" caps the GFX clock through the PMFW soft
+			 * maximum, within the SKU's DPM range; "s 1 0" removes
+			 * the cap.  The PPT limit is unchanged.
+			 */
+			if (cap && (input[1] < SMU_DPM_TABLE_MIN(gfx_table) ||
+				    input[1] > SMU_DPM_TABLE_MAX(gfx_table))) {
+				dev_info(adev->dev, "GFX clock cap must be 0 or within [%u, %u]!\n",
+					 SMU_DPM_TABLE_MIN(gfx_table),
+					 SMU_DPM_TABLE_MAX(gfx_table));
+				return -EINVAL;
+			}
+			return smu_v14_0_2_set_gfx_clk_max(smu, cap);
 		}
 
 		if (size != 1) {
@@ -2750,6 +2817,11 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 		break;
 
 	case PP_OD_RESTORE_DEFAULT_TABLE:
+		if (smu->user_dpm_profile.gfx_clk_max) {
+			ret = smu_v14_0_2_set_gfx_clk_max(smu, 0);
+			if (ret)
+				return ret;
+		}
 		if (size == 1) {
 			ret = smu_v14_0_2_od_restore_table_single(smu, input[0]);
 			if (ret)
@@ -2783,6 +2855,14 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
 			}
 
 			od_table->OverDriveTable.FeatureCtrlMask = 0;
+
+			/* Keep a user GFX clock cap across OD table uploads. */
+			if (smu->user_dpm_profile.gfx_clk_max) {
+				ret = smu_v14_0_set_performance_level(smu,
+								      smu->smu_dpm.dpm_level);
+				if (ret)
+					return ret;
+			}
 			memcpy(table_context->user_overdrive_table + offset_of_voltageoffset,
 			       (u8 *)od_table + offset_of_voltageoffset,
 			       sizeof(OverDriveTableExternal_t) - offset_of_voltageoffset);

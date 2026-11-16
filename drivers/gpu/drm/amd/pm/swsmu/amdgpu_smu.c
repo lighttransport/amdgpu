@@ -627,6 +627,17 @@ static void smu_restore_dpm_user_profile(struct smu_context *smu)
 		}
 	}
 
+	/*
+	 * The PMFW comes back from suspend without soft clock limits, and the
+	 * performance level is only reapplied when it changes, so re-apply a
+	 * user GFX clock cap explicitly, after any OD table upload above.
+	 */
+	if (smu->user_dpm_profile.gfx_clk_max) {
+		ret = smu_asic_set_performance_level(smu, smu_dpm_ctx->dpm_level);
+		if (ret)
+			dev_err(smu->adev->dev, "Failed to restore GFX clock cap\n");
+	}
+
 	/* Disable restore flag */
 	smu->user_dpm_profile.flags &= ~SMU_DPM_USER_PROFILE_RESTORE;
 }

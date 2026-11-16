@@ -261,6 +261,8 @@ struct smu_user_dpm_profile {
 	/* user clock state information */
 	uint32_t clk_mask[SMU_CLK_COUNT];
 	uint32_t clk_dependency;
+	/* user GFX clock cap in MHz (0 = none), set through OD "s 1 <MHz>" */
+	uint32_t gfx_clk_max;
 };
 
 #define SMU_TABLE_INIT(tables, table_id, s, a, d)	\

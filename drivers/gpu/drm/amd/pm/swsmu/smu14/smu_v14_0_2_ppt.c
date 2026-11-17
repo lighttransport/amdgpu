@@ -2505,10 +2505,20 @@ static int smu_v14_0_2_set_gfx_clk_max(struct smu_context *smu, uint32_t cap)
 
 	smu->user_dpm_profile.gfx_clk_max = cap;
 	if (!cap && old) {
-		/* Manual levels keep soft limits, so lift the old cap here. */
-		ret = smu_v14_0_set_soft_freq_limited_range(smu, SMU_GFXCLK, 0,
-							    SMU_DPM_TABLE_MAX(gfx_table),
-							    false);
+		/* Restore the soft limits that were in force before the cap. In
+		 * MANUAL mode the user's clk_mask values must be re-forced: simply
+		 * lifting to the DPM maximum defeats the pp_dpm_sclk selection,
+		 * because set_performance_level(MANUAL) returns early while no cap
+		 * is set and never re-applies those levels.
+		 */
+		if (smu->smu_dpm.dpm_level == AMD_DPM_FORCED_LEVEL_MANUAL &&
+		    smu->user_dpm_profile.clk_mask[SMU_SCLK] &&
+		    smu->ppt_funcs->force_clk_levels)
+			ret = smu->ppt_funcs->force_clk_levels(smu, SMU_SCLK,
+					smu->user_dpm_profile.clk_mask[SMU_SCLK]);
+		else
+			ret = smu_v14_0_set_soft_freq_limited_range(smu, SMU_GFXCLK,
+						0, SMU_DPM_TABLE_MAX(gfx_table), false);
 		if (ret)
 			goto restore;
 	}

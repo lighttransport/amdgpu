@@ -100,6 +100,9 @@ svm_migrate_gart_map(struct amdgpu_ring *ring,
 	return r;
 }
 
+static int svm_migrate_copy_done(struct amdgpu_device *adev,
+				 struct dma_fence *mfence);
+
 /**
  * svm_migrate_copy_memory_gart - sdma copy data between ram and vram
  *
@@ -114,8 +117,9 @@ svm_migrate_gart_map(struct amdgpu_ring *ring,
  * vram address uses direct mapping of vram pages, which must have npages
  * number of continuous pages.
  * GART update and sdma uses same buf copy function ring, sdma is splited to
- * multiple GTT_MAX_PAGES transfer, all sdma operations are serialized, wait for
- * the last sdma finish fence which is returned to check copy memory is done.
+ * multiple GTT_MAX_PAGES transfers. Check each completed batch before replacing
+ * its fence; a later successful batch must not hide an earlier copy error.
+ * The caller must complete and validate the final returned fence as well.
  *
  * Context: Process context
  *
@@ -140,9 +144,16 @@ svm_migrate_copy_memory_gart(struct amdgpu_device *adev, dma_addr_t *sys,
 	ring = to_amdgpu_ring(adev->mman.buffer_funcs_scheds[0]);
 	entity = &adev->mman.move_entities[0];
 
-	mutex_lock(&entity->lock);
-
 	while (npages) {
+		/* Do not discard an earlier batch's error when replacing its
+		 * fence. Wait outside the entity lock, which serializes submission.
+		 */
+		r = svm_migrate_copy_done(adev, *mfence);
+		*mfence = NULL;
+		if (r)
+			return r;
+
+		mutex_lock(&entity->lock);
 		size = min(GTT_MAX_PAGES, npages);
 
 		if (direction == FROM_VRAM_TO_RAM) {
@@ -167,14 +178,15 @@ svm_migrate_copy_memory_gart(struct amdgpu_device *adev, dma_addr_t *sys,
 			goto out_unlock;
 		}
 
-		dma_fence_put(*mfence);
 		*mfence = next;
+		mutex_unlock(&entity->lock);
 		npages -= size;
 		if (npages) {
 			sys += size;
 			vram += size;
 		}
 	}
+	return 0;
 
 out_unlock:
 	mutex_unlock(&entity->lock);
@@ -213,6 +225,9 @@ svm_migrate_copy_done(struct amdgpu_device *adev, struct dma_fence *mfence)
 			if (!dma_fence_is_signaled(mfence))
 				msleep(20);
 		}
+		r = dma_fence_get_status(mfence);
+		if (r > 0)
+			r = 0;
 		dma_fence_put(mfence);
 		pr_debug("sdma copy memory fence done\n");
 	}
@@ -380,6 +395,11 @@ svm_migrate_copy_to_vram(struct kfd_node *node, struct svm_range *prange,
 					 FROM_RAM_TO_VRAM, mfence);
 
 out_free_vram_pages:
+	/* Validate the final batch before the caller publishes any PFNs. */
+	if (!r) {
+		r = svm_migrate_copy_done(adev, *mfence);
+		*mfence = NULL;
+	}
 	if (r) {
 		pr_debug("failed %d to copy memory to vram\n", r);
 		svm_migrate_copy_done(adev, *mfence);
@@ -520,12 +540,13 @@ svm_migrate_vma_to_vram(struct kfd_node *node, struct svm_range *prange,
 		pr_debug("0x%lx pages collected\n", cpages);
 
 	r = svm_migrate_copy_to_vram(node, prange, &migrate, &mfence, scratch, ttm_res_offset);
-	migrate_vma_pages(&migrate);
+	if (!r)
+		migrate_vma_pages(&migrate);
 
-	svm_migrate_copy_done(adev, mfence);
 	migrate_vma_finalize(&migrate);
 
-	mpages = svm_migrate_successful_pages(&migrate);
+	if (!r)
+		mpages = svm_migrate_successful_pages(&migrate);
 	pr_debug("migrated/collected/requested 0x%lx/0x%lx/0x%lx\n",
 		 mpages, cpages, migrate.npages);
 
@@ -749,6 +770,11 @@ svm_migrate_copy_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
 		r = svm_migrate_copy_memory_gart(adev, dst + i - j, src + i - j, j,
 						 FROM_VRAM_TO_RAM, mfence);
 out_oom:
+	/* The producer consumes and validates every batch before publication. */
+	if (!r) {
+		r = svm_migrate_copy_done(adev, *mfence);
+		*mfence = NULL;
+	}
 	if (r) {
 		pr_debug("failed %d copy to ram\n", r);
 
@@ -881,13 +907,13 @@ svm_migrate_vma_to_ram(struct kfd_node *node, struct svm_range *prange,
 	/* dma_mapping_error() in the copy helper can return a positive flag. */
 	if (r > 0)
 		r = -EIO;
-	migrate_vma_pages(&migrate);
-
-	mpages = svm_migrate_successful_pages(&migrate);
+	if (!r) {
+		migrate_vma_pages(&migrate);
+		mpages = svm_migrate_successful_pages(&migrate);
+	}
 	pr_debug("migrated/collected/requested 0x%lx/0x%lx/0x%lx\n",
 		 mpages, cpages, migrate.npages);
 
-	svm_migrate_copy_done(adev, mfence);
 	migrate_vma_finalize(&migrate);
 
 	svm_range_dma_unmap_dev(adev->dev, scratch, 0, npages);

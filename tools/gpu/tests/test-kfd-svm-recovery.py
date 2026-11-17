@@ -104,7 +104,7 @@ static unsigned remaining[2],mode,allocations,finalizes,mmrefs,backing_drops;
 static int mmap_held;
 static unsigned last_moved;
 /* Modes: 1 later VMA copy error, 2 allocation failure in later VMA,
- * 3 later VMA missing, 4 copy error with committed progress,
+ * 3 later VMA missing, 4 copy error with candidates that must not commit,
  * 5 setup failure, 6 successful calls without progress,
  * 7 positive DMA mapping error predicate, 0 success. */
 static void *kvcalloc(size_t n,size_t size,int flags) {
@@ -180,12 +180,7 @@ int main(void) {
         int result=svm_range_evict_svm_bo(&b.bo);
         assert(result==(fault==3?-EFAULT:(fault==5 || fault==7)?-EIO:fault==6?-EBUSY:-ENOMEM));
         assert(!mmap_held && !spin_held && !mmrefs && !p.migrate_mutex.held);
-        if (fault==4) {
-            assert(!remaining[0] && !remaining[1] && pdd.page_out==4);
-            assert(!p.vram_pages && !p.actual_loc && !p.ttm_res && !p.svm_bo);
-            assert(backing_drops==1 && !b.kref && !b.evicting);
-            assert(!svm_range_evict_svm_bo(&b.bo));
-        } else {
+        {
             unsigned expected=(fault==5 || fault==6)?4:2;
             assert(p.vram_pages==expected && remaining[0]+remaining[1]==expected);
             assert(pdd.page_out==4-expected && p.actual_loc && p.ttm_res);

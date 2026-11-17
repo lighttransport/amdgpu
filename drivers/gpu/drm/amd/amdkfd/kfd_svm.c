@@ -357,6 +357,10 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 	pr_debug("svms 0x%p prange 0x%p [0x%lx 0x%lx]\n", prange->svms, prange,
 		 prange->start, prange->last);
 
+	/* Eviction can relink a partially migrated range. Wait before unlinking
+	 * so a failed eviction cannot put a range being freed back on the BO.
+	 */
+	mutex_lock(&prange->migrate_mutex);
 	/* Unlink from range_list; no-op if already unlinked. */
 	if (prange->svm_bo) {
 		spin_lock(&prange->svm_bo->list_lock);
@@ -364,11 +368,8 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 		spin_unlock(&prange->svm_bo->list_lock);
 	}
 
-	/* Wait for any in-flight eviction of this range to finish. */
-	mutex_lock(&prange->migrate_mutex);
-	mutex_unlock(&prange->migrate_mutex);
-
 	svm_range_vram_node_free(prange);
+	mutex_unlock(&prange->migrate_mutex);
 	if (do_unmap)
 		svm_range_dma_unmap(prange);
 	svm_range_put_pages(prange);
@@ -4029,8 +4030,6 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 		 */
 		if (!mutex_trylock(&prange->migrate_mutex)) {
 			pr_debug("skip eviction, contended migrate_mutex\n");
-			/* Clear evicting so the BO keeps being reused. */
-			WRITE_ONCE(svm_bo->evicting, 0);
 			r = -EBUSY;
 			break;
 		}
@@ -4049,10 +4048,17 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 					KFD_MIGRATE_TRIGGER_TTM_EVICTION, NULL);
 		} while (!r && prange->actual_loc && --retries);
 
-		if (!r && prange->actual_loc)
-			pr_info_once("Migration failed during eviction");
-
-		if (!prange->actual_loc) {
+		if (prange->actual_loc) {
+			/* A successful migration call can leave pages in VRAM.
+			 * Keep this range discoverable by the next eviction and by
+			 * BO release. migrate_mutex pins it until it is relinked.
+			 */
+			spin_lock(&svm_bo->list_lock);
+			list_add(&prange->svm_bo_list, &svm_bo->range_list);
+			spin_unlock(&svm_bo->list_lock);
+			if (!r)
+				r = -EBUSY;
+		} else {
 			mutex_lock(&prange->lock);
 			prange->svm_bo = NULL;
 			mutex_unlock(&prange->lock);
@@ -4061,6 +4067,9 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 
 		spin_lock(&svm_bo->list_lock);
 	}
+	/* Failed eviction leaves a live BO; allow its ranges to reuse it. */
+	if (r)
+		WRITE_ONCE(svm_bo->evicting, 0);
 	spin_unlock(&svm_bo->list_lock);
 	mmap_read_unlock(mm);
 	/* Defer mmput: exit_mmap() must not run under the BO reservation. */

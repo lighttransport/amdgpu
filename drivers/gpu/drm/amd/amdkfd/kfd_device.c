@@ -1005,6 +1005,8 @@ out:
 
 void kgd2kfd_device_exit(struct kfd_dev *kfd)
 {
+	bool was_suspended;
+
 	/* Keep node/DQM owners alive until process release drains its SVM state. */
 	kgd2kfd_teardown_processes(kfd->adev);
 
@@ -1020,7 +1022,12 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
 		mutex_destroy(&kfd->profiler_lock);
 	}
 
-	/* Drop only global references owned by the device being removed. */
+	/* Drop only global references owned by the device being removed. If
+	 * that was the last global lock, processes on the remaining devices
+	 * must be resumed just as kgd2kfd_resume_process() would do; otherwise
+	 * a removed suspended device leaves them evicted forever.
+	 */
+	was_suspended = kfd->suspend_count > 0 || kfd->reset_locked;
 	mutex_lock(&kfd_processes_mutex);
 	kfd_locked -= kfd->suspend_count;
 	kfd->suspend_count = 0;
@@ -1028,6 +1035,8 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
 		--kfd_locked;
 		kfd->reset_locked = false;
 	}
+	if (was_suspended && kfd_locked == 0)
+		kfd_resume_all_processes();
 	mutex_unlock(&kfd_processes_mutex);
 
 	kfree(kfd);

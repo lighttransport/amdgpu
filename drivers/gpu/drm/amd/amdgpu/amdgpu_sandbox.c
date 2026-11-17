@@ -63,6 +63,7 @@ struct amdgpu_sandbox {
 	unsigned int history_next;
 	u32 window_count, threshold, window_ms;
 	u32 state, mode;
+	u32 quarantine_attempts;
 	spinlock_t lock;
 	struct mutex ranges_lock;
 	struct list_head ranges;
@@ -447,10 +448,20 @@ static void sb_quarantine_work(struct work_struct *work)
 	 */
 	spin_lock_irqsave(&sb->lock, flags);
 	if (retry && !READ_ONCE(sb_stopping) &&
-	    sb->state == AMDGPU_SB_QUARANTINED &&
-	    queue_delayed_work(sb_wq, &sb->quarantine_work, msecs_to_jiffies(100))) {
-		spin_unlock_irqrestore(&sb->lock, flags);
-		return;
+	    sb->state == AMDGPU_SB_QUARANTINED) {
+		u32 shift = min(sb->quarantine_attempts, 8U);
+		unsigned long delay = msecs_to_jiffies(100UL << shift);
+
+		/* Back off a persistently contended quarantine instead of
+		 * spinning at 10 Hz. The policy stays QUARANTINED and retries
+		 * continue (up to ~26 s apart), so this never fails open.
+		 */
+		if (sb->quarantine_attempts < U32_MAX)
+			sb->quarantine_attempts++;
+		if (queue_delayed_work(sb_wq, &sb->quarantine_work, delay)) {
+			spin_unlock_irqrestore(&sb->lock, flags);
+			return;
+		}
 	}
 	spin_unlock_irqrestore(&sb->lock, flags);
 done:
@@ -462,6 +473,7 @@ static void sb_quarantine_locked(struct amdgpu_sandbox *sb)
 	if (READ_ONCE(sb_stopping) || sb->state != AMDGPU_SB_ACTIVE)
 		return;
 	sb->state = AMDGPU_SB_QUARANTINED;
+	sb->quarantine_attempts = 0;
 	sb_event(sb, AMDGPU_SB_EVENT_QUARANTINE, 0, 0, 0);
 	amdgpu_sb_get(sb);
 	if (!queue_delayed_work(sb_wq, &sb->quarantine_work, 0))

@@ -2671,6 +2671,7 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 	struct svm_range_list *svms;
 	struct svm_range *prange;
 	struct mm_struct *mm;
+	enum svm_work_list_ops op;
 	int ret;
 
 	svms = container_of(work, struct svm_range_list, deferred_list_work);
@@ -2682,8 +2683,13 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 					  struct svm_range, deferred_list);
 		spin_unlock(&svms->deferred_list_lock);
 
+		/* Preserve the caller's requested operation. A child drain failure
+		 * must not turn a notifier update into an unmap of the surviving
+		 * parent range when this work item is requeued.
+		 */
+		op = prange->work_item.op;
 		pr_debug("prange 0x%p [0x%lx 0x%lx] op %d\n", prange,
-			 prange->start, prange->last, prange->work_item.op);
+			 prange->start, prange->last, op);
 
 		mm = prange->work_item.mm;
 
@@ -2748,8 +2754,7 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 		 */
 		if (ret) {
 			msleep(100);
-			svm_range_add_list_work(svms, prange, mm,
-						SVM_OP_UNMAP_RANGE);
+			svm_range_add_list_work(svms, prange, mm, op);
 			schedule_deferred_list_work(svms);
 		}
 

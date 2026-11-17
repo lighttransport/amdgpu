@@ -563,6 +563,7 @@ static void svm_range_bo_unref(struct svm_range_bo *svm_bo)
 static bool
 svm_range_validate_svm_bo(struct kfd_node *node, struct svm_range *prange)
 {
+retry:
 	mutex_lock(&prange->lock);
 	if (!prange->svm_bo) {
 		mutex_unlock(&prange->lock);
@@ -611,15 +612,13 @@ svm_range_validate_svm_bo(struct kfd_node *node, struct svm_range *prange)
 		mutex_unlock(&prange->lock);
 	}
 
-	/* We need a new svm_bo. Spin-loop to wait for concurrent
-	 * svm_range_bo_release to finish removing this range from
-	 * its range list and set prange->svm_bo to null. After this,
-	 * it is safe to reuse the svm_bo pointer and svm_bo_list head.
+	/* Recheck under the range lock after yielding. An aborted eviction
+	 * makes the live BO reusable; waiting only for release would spin
+	 * forever while another range retains its reference. A zero-ref BO
+	 * must still wait for release to clear the association, never resurrect.
 	 */
-	while (!list_empty_careful(&prange->svm_bo_list) || prange->svm_bo)
-		cond_resched();
-
-	return false;
+	cond_resched();
+	goto retry;
 }
 
 #define to_svm_range_bo(bo) container_of((bo), struct svm_range_bo, bo)

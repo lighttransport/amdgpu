@@ -776,17 +776,19 @@ out_oom:
  * @node: kfd node device to migrate from
  * @trigger: reason of migration
  * @fault_page: is from vmf->page, svm_migrate_to_ram(), this is CPU page fault callback
+ * @migrated: number of pages whose migration committed
  *
  * Context: Process context, caller hold mmap read lock, prange->migrate_mutex
  *
  * Return:
- *   negative values - indicate error
- *   positive values or zero - number of pages got migrated
+ *   zero on success, otherwise error code. @migrated reports committed
+ *   progress even when a later operation fails.
  */
-static long
+static int
 svm_migrate_vma_to_ram(struct kfd_node *node, struct svm_range *prange,
 		       struct vm_area_struct *vma, u64 start, u64 end,
-		       uint32_t trigger, struct page *fault_page)
+		       uint32_t trigger, struct page *fault_page,
+		       unsigned long *migrated)
 {
 	struct kfd_process *p = container_of(prange->svms, struct kfd_process, svms);
 	u64 npages = (end - start) >> PAGE_SHIFT;
@@ -855,6 +857,9 @@ svm_migrate_vma_to_ram(struct kfd_node *node, struct svm_range *prange,
 
 	r = svm_migrate_copy_to_ram(adev, prange, &migrate, &mfence,
 				    scratch, npages);
+	/* dma_mapping_error() in the copy helper can return a positive flag. */
+	if (r > 0)
+		r = -EIO;
 	migrate_vma_pages(&migrate);
 
 	mpages = svm_migrate_successful_pages(&migrate);
@@ -872,13 +877,14 @@ out_free:
 				    start >> PAGE_SHIFT, end >> PAGE_SHIFT,
 				    node->id, 0, trigger, r);
 out:
-	if (!r && mpages) {
+	*migrated = mpages;
+	if (mpages) {
 		pdd = svm_range_get_pdd_by_node(prange, node);
 		if (pdd)
 			WRITE_ONCE(pdd->page_out, pdd->page_out + mpages);
 	}
 
-	return r ? r : mpages;
+	return r;
 }
 
 /**
@@ -905,7 +911,7 @@ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm,
 	unsigned long start;
 	unsigned long end;
 	unsigned long mpages = 0;
-	long r = 0;
+	int r = 0;
 
 	/* this pragne has no any vram page to migrate to sys ram */
 	if (!prange->actual_loc) {
@@ -934,6 +940,7 @@ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm,
 
 	for (addr = start; addr < end;) {
 		unsigned long next;
+		unsigned long migrated;
 
 		vma = vma_lookup(mm, addr);
 		if (!vma) {
@@ -944,29 +951,29 @@ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm,
 
 		next = min(vma->vm_end, end);
 		r = svm_migrate_vma_to_ram(node, prange, vma, addr, next, trigger,
-			fault_page);
+					   fault_page, &migrated);
+		mpages += migrated;
 		if (r < 0) {
-			pr_debug("failed %ld to migrate prange %p\n", r, prange);
+			pr_debug("failed %d to migrate prange %p\n", r, prange);
 			break;
-		} else {
-			mpages += r;
 		}
 		addr = next;
 	}
 
-	if (r >= 0) {
-		WARN_ONCE(prange->vram_pages < mpages,
-			  "Recorded vram pages(0x%llx) should not be less than migration pages(0x%lx).",
-			  prange->vram_pages, mpages);
-		prange->vram_pages -= mpages;
+	/* Earlier VMAs have already committed their migrations even when a
+	 * later VMA fails. Keep the remaining-page ledger accurate for retry.
+	 */
+	WARN_ONCE(prange->vram_pages < mpages,
+		  "Recorded vram pages(0x%llx) should not be less than migration pages(0x%lx).",
+		  prange->vram_pages, mpages);
+	prange->vram_pages -= mpages;
 
-		/* prange does not have vram page set its actual_loc to system
-		 * and drop its svm_bo ref
-		 */
-		if (prange->vram_pages == 0 && prange->ttm_res) {
-			prange->actual_loc = 0;
-			svm_range_vram_node_free(prange);
-		}
+	/* prange does not have vram page set its actual_loc to system
+	 * and drop its svm_bo ref
+	 */
+	if (prange->vram_pages == 0 && prange->ttm_res) {
+		prange->actual_loc = 0;
+		svm_range_vram_node_free(prange);
 	}
 
 	return r < 0 ? r : 0;

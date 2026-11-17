@@ -43,9 +43,15 @@ long amdgpu_kms_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
 	int ret;
 
-	ret = amdgpu_sb_identity(fpriv->sandbox, drm_to_adev(file_priv->minor->dev));
-	if (ret)
-		return ret;
+	/* Mirror the non-compat path: driver_priv is NULL until the DRM open
+	 * post-hook installs it (and again after postclose).
+	 */
+	if (fpriv) {
+		ret = amdgpu_sb_identity(fpriv->sandbox,
+					 drm_to_adev(file_priv->minor->dev));
+		if (ret)
+			return ret;
+	}
 
 	if (nr < DRM_COMMAND_BASE)
 		return drm_compat_ioctl(filp, cmd, arg);

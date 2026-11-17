@@ -789,6 +789,18 @@ amdgpu_userq_create_impl(struct drm_file *filp, union drm_amdgpu_userq *args)
 			mutex_unlock(&uq_mgr->userq_mutex);
 			goto erase_doorbell;
 		}
+		/* Quarantine can happen after the admission check but before the
+		 * map. The helper intentionally leaves such a queue unmapped;
+		 * reporting that as a successful create hands userspace a queue
+		 * that can never run. Fail instead.
+		 */
+		if (amdgpu_sb_check(queue->sandbox)) {
+			r = -EACCES;
+			drm_file_err(uq_mgr->file, "Queue quarantined during creation\n");
+			trace_amdgpu_userq_create_end(queue, r);
+			mutex_unlock(&uq_mgr->userq_mutex);
+			goto erase_doorbell;
+		}
 	}
 
 	atomic_inc(&uq_mgr->userq_count[queue->queue_type]);

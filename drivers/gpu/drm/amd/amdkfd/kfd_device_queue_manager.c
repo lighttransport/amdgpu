@@ -552,11 +552,22 @@ static int reset_queues_mes(struct device_queue_manager *dqm, struct queue *q)
 	queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
 	/* pass the known bad queue info to the reset function */
 	r = amdgpu_gfx_reset_mes_compute(adev, NULL, NULL, NULL, &num_hung, &queue_input);
-	/* MES must positively identify this same queue. Other hung queues or a
-	 * preemptible queue removed during recovery do not implicate its owner.
+	/* MES must positively identify this same queue by doorbell. The
+	 * is_reset flag is only set after this helper returns, so it cannot
+	 * identify a fresh hang; other hung queues must not implicate this
+	 * queue's owner.
 	 */
-	if (num_hung && q->properties.is_reset)
-		kfd_queue_sandbox_fault(q);
+	if (num_hung) {
+		unsigned int j;
+
+		for (j = 0; j < num_hung; j++) {
+			if (adev->gfx.mec.mes_hung_db_array[j] ==
+			    q->properties.doorbell_off) {
+				kfd_queue_sandbox_fault(q);
+				break;
+			}
+		}
+	}
 	if (r)
 		goto fail;
 	pdd = kfd_get_process_device_data(q->device, q->process);

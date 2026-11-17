@@ -167,7 +167,7 @@ int main(void) {
 }
 '''
 code = prefix + '\n'.join(function(n) for n in (
-    '__smu_msg_v1_send', '__smu_msg_v1_etime_track',
+    '__smu_msg_v1_send', '__smu_msg_v1_etime_track', 'smu_msg_is_reset_ack',
     'smu_msg_v1_send_msg', 'smu_msg_v1_wait_response')) + main
 with tempfile.TemporaryDirectory(prefix='smu-etime-test-') as tmp:
     path = pathlib.Path(tmp)

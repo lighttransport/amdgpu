@@ -510,6 +510,16 @@ static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 	return 0;
 }
 
+/* Reset ACK messages are the SMU-based recovery path. Fail-fast on a hung
+ * firmware must not reject them, or the driver loses the very mechanism it
+ * uses to recover a slow-but-responsive PMFW.
+ */
+static bool smu_msg_is_reset_ack(u32 msg)
+{
+	return msg == SMU_MSG_DriverMode2Reset ||
+	       msg == SMU_MSG_GfxDeviceDriverReset;
+}
+
 /**
  * smu_msg_v1_send_msg - Complete V1 protocol with all filtering
  * @ctl: Message control block
@@ -560,8 +570,10 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	if (ret)
 		goto out;
 
-	/* FW state checks */
-	if (smu->smc_fw_state == SMU_FW_HANG) {
+	/* FW state checks. Reset ACK messages bypass the hang gate so a
+	 * firmware marked hung by a timeout streak can still be reset.
+	 */
+	if (smu->smc_fw_state == SMU_FW_HANG && !smu_msg_is_reset_ack(args->msg)) {
 		dev_err(adev->dev,
 			"SMU is in hanged state, failed to send smu message!\n");
 		ret = -EREMOTEIO;
@@ -673,7 +685,11 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 	u32 reg;
 	int ret;
 
-	if (smu->smc_fw_state == SMU_FW_HANG)
+	/* The reset ACK loop must observe its own completion even after the
+	 * streak policy marked the firmware hung.
+	 */
+	if (smu->smc_fw_state == SMU_FW_HANG &&
+	    !smu_msg_is_reset_ack(ctl->last_msg))
 		return -EREMOTEIO;
 
 	smu_lte_trace(ctl, "wait-begin", ctl->last_msg, 0, 0, 0, timeout_us);
@@ -682,6 +698,14 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 
 	if (ret == -EREMOTEIO)
 		smu->smc_fw_state = SMU_FW_HANG;
+	/* A completed reset ACK proves the firmware is responsive again; clear
+	 * the fail-fast state so ordinary messages are no longer blocked.
+	 */
+	else if (ret == 0 && smu_msg_is_reset_ack(ctl->last_msg) &&
+		 smu->smc_fw_state == SMU_FW_HANG) {
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
+	}
 	/*
 	 * Reset callers own a longer, bounded ACK wait. Timing out one poll
 	 * must not prevent a later poll from observing reset completion.

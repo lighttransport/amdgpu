@@ -45,6 +45,9 @@ svm_migrate_direct_mapping_addr(struct amdgpu_device *adev, u64 addr)
 	return addr + amdgpu_ttm_domain_start(adev, TTM_PL_VRAM);
 }
 
+static int svm_migrate_copy_done(struct amdgpu_device *adev,
+				 struct dma_fence *mfence);
+
 static int
 svm_migrate_gart_map(struct amdgpu_ring *ring,
 		     struct amdgpu_ttm_buffer_entity *entity,
@@ -60,6 +63,7 @@ svm_migrate_gart_map(struct amdgpu_ring *ring,
 	void *cpu_addr;
 	int r;
 
+	lockdep_assert_held(&entity->lock);
 	*gart_addr = amdgpu_compute_gart_address(&adev->gmc, entity, 0);
 
 	num_dw = ALIGN(adev->mman.buffer_funcs->copy_num_dw, 8);
@@ -95,13 +99,11 @@ svm_migrate_gart_map(struct amdgpu_ring *ring,
 
 	amdgpu_gart_map(adev, 0, npages, addr, pte_flags, cpu_addr);
 	fence = amdgpu_job_submit(job);
-	dma_fence_put(fence);
-
-	return r;
+	/* Keep the window reserved through map completion and copy submission.
+	 * Scheduling order alone cannot propagate a late mapping-job error.
+	 */
+	return svm_migrate_copy_done(adev, fence);
 }
-
-static int svm_migrate_copy_done(struct amdgpu_device *adev,
-				 struct dma_fence *mfence);
 
 /**
  * svm_migrate_copy_memory_gart - sdma copy data between ram and vram

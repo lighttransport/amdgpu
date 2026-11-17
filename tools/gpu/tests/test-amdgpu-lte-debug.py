@@ -22,7 +22,7 @@ def prefix(name):
 
 def function(path, name):
     source = (root / path).read_text()
-    match = re.search(r'(?:static )?(?:inline )?(?:int|u32|void) ' + name + r'\([^;]+?\)\n\{', source)
+    match = re.search(r'(?:static )?(?:inline )?(?:int|u32|void|bool) ' + name + r'\([^;]+?\)\n\{', source)
     assert match, name
     end, depth = match.end(), 1
     while depth:
@@ -66,7 +66,7 @@ static void trace_amdgpu_lte_smu(struct amdgpu_device *a, const char *p, const c
 '''
 smu += '\n'.join(function(base + 'pm/swsmu/smu_cmn.c', n) for n in (
     'smu_lte_trace', '__smu_msg_v1_send', '__smu_msg_v1_etime_track',
-    'smu_msg_v1_send_msg', 'smu_msg_v1_wait_response'))
+    'smu_msg_is_reset_ack', 'smu_msg_v1_send_msg', 'smu_msg_v1_wait_response'))
 smu += r'''
 int main(void) {
  struct amdgpu_device adev = {0};

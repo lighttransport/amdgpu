@@ -2272,8 +2272,13 @@ int kfd_process_device_create_obj_handle(struct kfd_process_device *pdd,
 		handle = idr_alloc(&pdd->alloc_idr, buf_obj, preferred_id,
 						preferred_id + 1, GFP_KERNEL);
 
-	if (handle < 0)
+	if (handle < 0) {
+		/* The node was published before idr_alloc; unlink it before
+		 * freeing so a later interval-tree walk cannot use freed memory.
+		 */
+		interval_tree_remove(&buf_obj->it, &p->bo_interval_tree);
 		kfree(buf_obj);
+	}
 
 	return handle;
 }

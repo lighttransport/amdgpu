@@ -21,6 +21,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 #include <linux/types.h>
+#include <linux/delay.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
 #include <linux/migrate.h>
@@ -202,7 +203,16 @@ svm_migrate_copy_done(struct amdgpu_device *adev, struct dma_fence *mfence)
 	int r = 0;
 
 	if (mfence) {
-		r = dma_fence_wait(mfence, false);
+		/* A wait error does not prove that DMA stopped using its pages. */
+		while (!dma_fence_is_signaled(mfence)) {
+			r = dma_fence_wait(mfence, false);
+			if (r < 0)
+				dev_err_ratelimited(adev->dev,
+					"copy drain wait failed %d; retaining destinations\n",
+					r);
+			if (!dma_fence_is_signaled(mfence))
+				msleep(20);
+		}
 		dma_fence_put(mfence);
 		pr_debug("sdma copy memory fence done\n");
 	}
@@ -324,6 +334,7 @@ svm_migrate_copy_to_vram(struct kfd_node *node, struct svm_range *prange,
 					      DMA_BIDIRECTIONAL);
 			r = dma_mapping_error(dev, src[i]);
 			if (r) {
+				r = -EIO;
 				src[i] = 0;
 				dev_err(dev, "%s: fail %d dma_map_page\n",
 					__func__, r);
@@ -371,8 +382,10 @@ svm_migrate_copy_to_vram(struct kfd_node *node, struct svm_range *prange,
 out_free_vram_pages:
 	if (r) {
 		pr_debug("failed %d to copy memory to vram\n", r);
+		svm_migrate_copy_done(adev, *mfence);
+		*mfence = NULL;
 		for (i = 0; i < npages && mpages; i++) {
-			if (!dst[i])
+			if (!(migrate->dst[i] & MIGRATE_PFN_VALID))
 				continue;
 			svm_migrate_put_vram_page(adev, dst[i]);
 			migrate->dst[i] = 0;
@@ -716,6 +729,7 @@ svm_migrate_copy_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
 		dst[i] = dma_map_page(dev, dpage, 0, PAGE_SIZE, DMA_BIDIRECTIONAL);
 		r = dma_mapping_error(dev, dst[i]);
 		if (r) {
+			r = -EIO;
 			dev_err(adev->dev, "%s: fail %d dma_map_page\n", __func__, r);
 			dst[i] = 0;
 			goto out_oom;
@@ -737,6 +751,13 @@ svm_migrate_copy_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
 out_oom:
 	if (r) {
 		pr_debug("failed %d copy to ram\n", r);
+
+		/* Earlier batches may still write these destinations. Drain them
+		 * before cleanup, preserving r. Consume the fence here so the
+		 * caller cannot wait on or put it a second time.
+		 */
+		svm_migrate_copy_done(adev, *mfence);
+		*mfence = NULL;
 
 		/* first release current dpage when dma_map_page fail */
 		if (dpage) {

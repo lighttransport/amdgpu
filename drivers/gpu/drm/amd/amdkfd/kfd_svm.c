@@ -3668,12 +3668,14 @@ int svm_range_list_fini(struct kfd_process *p)
 	list_for_each_entry_safe(prange, next, &p->svms.list, list) {
 		int r;
 
-		/* Removal waits for any interval callback before the final drain. */
-		svm_range_remove_notifier(prange);
-
+		/* Keep the notifier until the GPU drain succeeds. A range that
+		 * is retained on failure still has live GPU PTEs and must stay
+		 * notified: retries never re-register a removed notifier, and a
+		 * CPU page-table change must still be able to invalidate those
+		 * PTEs.
+		 */
 		list_for_each_entry_safe(pchild, child_next,
 					 &prange->child_list, child_list) {
-			svm_range_remove_notifier(pchild);
 			r = svm_range_unmap_from_gpus(pchild, pchild->start,
 						      pchild->last,
 						      pchild->bitmap_mapped,
@@ -3686,6 +3688,7 @@ int svm_range_list_fini(struct kfd_process *p)
 					ret = r ? r : -EIO;
 				continue;
 			}
+			svm_range_remove_notifier(pchild);
 			list_del_init(&pchild->child_list);
 			svm_range_free(pchild, true);
 		}
@@ -3707,6 +3710,7 @@ int svm_range_list_fini(struct kfd_process *p)
 			continue;
 		}
 
+		svm_range_remove_notifier(prange);
 		svm_range_unlink(prange);
 		svm_range_free(prange, true);
 	}

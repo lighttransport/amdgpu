@@ -2761,10 +2761,15 @@ static int kfd_process_evict_ttm(struct kfd_process *p)
 
 		kfd_smi_event_queue_eviction(pdd->dev, p->lead_thread,
 					     KFD_QUEUE_EVICTION_TRIGGER_TTM);
+		/* A retained reference from a failed attempt must be retried, not
+		 * acquired again: a fresh acquire would inflate the eviction
+		 * counters while the old drain is still pending.
+		 */
 		r = pdd->dev->dqm->ops.evict_process_queues_ref(pdd->dev->dqm,
 							     &pdd->qpd,
 							     KFD_EVICTION_OWNER_TTM,
-							     &acquired, false);
+							     &acquired,
+							     pdd->ttm_evicted > 0);
 		if (acquired)
 			pdd->ttm_evicted++;
 		if (r && !ret)
@@ -2847,9 +2852,18 @@ static void evict_process_worker(struct work_struct *work)
 	/* Every acquired reference belongs to this worker's ledger. Coalescing
 	 * work neither consumes references nor creates a second owner.
 	 */
-	if (kfd_process_has_ttm_refs(p))
-		mod_delayed_work(kfd_restore_wq, &p->restore_work,
-				 msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
+	if (kfd_process_has_ttm_refs(p)) {
+		if (ret)
+			/* Re-drive the failed eviction. The restore path refuses
+			 * queues with a pending drain, so rescheduling only the
+			 * restore worker would spin without ever clearing it.
+			 */
+			mod_delayed_work(kfd_restore_wq, &p->eviction_work,
+					 msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
+		else
+			mod_delayed_work(kfd_restore_wq, &p->restore_work,
+					 msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
+	}
 	trace_kfd_evict_process_worker_end(p, ret ? "Failed" : "Success");
 	mutex_unlock(&p->ttm_restore_lock);
 }

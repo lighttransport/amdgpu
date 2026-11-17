@@ -4043,6 +4043,10 @@ static long kfd_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	 * processes need to create their own KFD device context.
 	 */
 	process = filep->private_data;
+	if (!process) {
+		retcode = -ESRCH;
+		goto err_i1;
+	}
 	retcode = amdgpu_sb_check_current(process->sandbox, NULL);
 	if (retcode)
 		goto err_i1;

@@ -132,7 +132,11 @@ int main(void) {
  assert(smu.user_dpm_profile.ppt_limit_user_mask[0] == 0);
  init(); amdgpu_smu_min_power_cap = 150; clamp = true;
  assert(smu_set_ppt_limit(&smu, 0, 170) == -EIO);
- assert(smu.user_dpm_profile.ppt_limit_user_mask[0] == 0);
+ /* The firmware applied 212 W despite the mismatch; record that plausible
+  * value so resume restores what the hardware holds, while the write still
+  * reports failure. Implausible read-backs below are not recorded. */
+ assert(smu.user_dpm_profile.ppt_limit_user_mask[0] == BIT(SMU_DEFAULT_PPT_LIMIT));
+ assert(smu.user_dpm_profile.ppt_limits[0][SMU_DEFAULT_PPT_LIMIT] == 212);
  /* Firmware read-back is untrusted u32; comparison must not overflow signed int. */
  u32 corrupt[] = {0, 0x80000000U, UINT32_MAX};
  for (unsigned i = 0; i < sizeof(corrupt)/sizeof(corrupt[0]); i++) {

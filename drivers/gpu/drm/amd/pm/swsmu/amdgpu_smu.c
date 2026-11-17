@@ -3167,6 +3167,17 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 			dev_err(smu->adev->dev,
 				"PPT limit read-back mismatch: set %u, firmware holds %u; refusing the write\n",
 				limit, held);
+			/* The firmware did apply a value even though it differs from
+			 * the request. Record that actual value (when plausible)
+			 * so a later resume restores what the hardware holds, not
+			 * the stale value the write was intended to replace.
+			 */
+			if (held != U32_MAX && held >= min_limit && held <= max_limit &&
+			    !(smu->user_dpm_profile.flags & SMU_DPM_USER_PROFILE_RESTORE)) {
+				smu->user_dpm_profile.ppt_limits[power_source][limit_type] = held;
+				smu->user_dpm_profile.ppt_limit_user_mask[power_source] |=
+					BIT(limit_type);
+			}
 			return -EIO;
 		}
 	}

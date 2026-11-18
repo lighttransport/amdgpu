@@ -2781,9 +2781,15 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 		 * strand the mapped range until process exit.
 		 */
 		if (ret) {
-			msleep(100);
-			svm_range_add_list_work(svms, prange, mm, op);
-			schedule_deferred_list_work(svms);
+			if (atomic_read(&svms->drain_pagefaults)) {
+				/* Teardown in progress: do not re-arm, the range
+				 * stays on svms->list for the final drain.
+				 */
+			} else {
+				msleep(100);
+				svm_range_add_list_work(svms, prange, mm, op);
+				schedule_deferred_list_work(svms);
+			}
 		}
 
 		/* Pairs with mmget in svm_range_add_list_work. If dropping the
@@ -3682,7 +3688,12 @@ int svm_range_list_fini(struct kfd_process *p)
 
 	cancel_delayed_work_sync(&p->svms.restore_work);
 
-	/* Ensure list work is finished before process is destroyed */
+	/* Stop deferred work from re-arming itself while we tear down; a
+	 * self-requeued instance is not covered by a single flush_work() and
+	 * could later touch freed svms/ranges. Ranges left unmapped here remain
+	 * on svms->list and are drained by the loop below.
+	 */
+	atomic_set(&p->svms.drain_pagefaults, 1);
 	flush_work(&p->svms.deferred_list_work);
 
 	/*
@@ -3690,7 +3701,6 @@ int svm_range_list_fini(struct kfd_process *p)
 	 * not find kfd process and take mm lock to recover fault.
 	 * stop kfd page fault handing, then wait pending page faults got drained
 	 */
-	atomic_set(&p->svms.drain_pagefaults, 1);
 	svm_range_drain_retry_fault(&p->svms);
 
 	list_for_each_entry_safe(prange, next, &p->svms.list, list) {

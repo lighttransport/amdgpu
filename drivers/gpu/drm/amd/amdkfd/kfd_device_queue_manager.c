@@ -1225,10 +1225,10 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 	 * left it with the stale value and programmed the wrong mask.
 	 */
 	if (q->gws && !q->properties.is_gws) {
-		/* Only account here when the active state is unchanged. If it
-		 * changes in the same call, increment/decrement_queue_count()
-		 * below accounts GWS using the new is_gws value; doing both
-		 * would double-count.
+		/* is_active still holds the pre-update_mqd value here. Account
+		 * the GWS change against that old active state; the active-state
+		 * transition below accounts GWS against the new is_gws value.
+		 * The GwsCountOnce model proves this counts each transition once.
 		 */
 		if (q->properties.is_active &&
 		    q->properties.is_active == prev_active) {

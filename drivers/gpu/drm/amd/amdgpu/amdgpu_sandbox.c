@@ -944,6 +944,7 @@ void amdgpu_sb_fini(void)
 		sb->state = AMDGPU_SB_DEVICE_GONE;
 		spin_unlock_irqrestore(&sb->lock, flags);
 		list_del_rcu(&sb->node);
+		sb_policy_count--;
 		list_add_tail(&sb->gc_node, &retired);
 	}
 	mutex_unlock(&sb_registry_lock);
@@ -956,4 +957,5 @@ void amdgpu_sb_fini(void)
 		amdgpu_sb_put(sb);
 	}
 	destroy_workqueue(sb_wq);
+	sb_wq = NULL;
 }

@@ -476,6 +476,18 @@ static void __smu_msg_v1_etime_track(struct smu_msg_ctl *ctl, int ret)
 		RREG32(ctl->config.msg_reg));
 }
 
+/* Reset ACK messages are the SMU-based recovery path. Fail-fast on a hung
+ * firmware must not reject them, or the driver loses the very mechanism it
+ * uses to recover a slow-but-responsive PMFW.
+ */
+static bool smu_msg_is_reset_ack(u32 msg)
+{
+	return msg == SMU_MSG_DriverMode2Reset ||
+	       msg == SMU_MSG_GfxDeviceDriverReset ||
+	       msg == SMU_MSG_GfxDriverResetRecovery ||
+	       msg == SMU_MSG_Mode2Reset;
+}
+
 static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 				   enum smu_message_type msg, u32 msg_flags,
 				   bool *skip_pre_poll)
@@ -490,8 +502,12 @@ static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 
 	fed_status = amdgpu_ras_get_fed_status(adev);
 
-	/* Block non-RAS-priority messages during RAS error */
-	if (fed_status && !(msg_flags & SMU_MSG_RAS_PRI)) {
+	/* Block non-RAS-priority messages during RAS error. Reset ACKs must get
+	 * through: they are the recovery path from a wedged firmware and some
+	 * reset enums are not mapped RAS_PRI.
+	 */
+	if (fed_status && !(msg_flags & SMU_MSG_RAS_PRI) &&
+	    !smu_msg_is_reset_ack(msg)) {
 		dev_dbg(adev->dev, "RAS error detected, skip sending %s",
 			smu_get_message_name(smu, msg));
 		return -EACCES;
@@ -508,18 +524,6 @@ static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 	}
 
 	return 0;
-}
-
-/* Reset ACK messages are the SMU-based recovery path. Fail-fast on a hung
- * firmware must not reject them, or the driver loses the very mechanism it
- * uses to recover a slow-but-responsive PMFW.
- */
-static bool smu_msg_is_reset_ack(u32 msg)
-{
-	return msg == SMU_MSG_DriverMode2Reset ||
-	       msg == SMU_MSG_GfxDeviceDriverReset ||
-	       msg == SMU_MSG_GfxDriverResetRecovery ||
-	       msg == SMU_MSG_Mode2Reset;
 }
 
 /**
@@ -657,7 +661,14 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	} else if (ret != 0) {
 		__smu_msg_v1_print_error(ctl, reg, args);
 	}
-	if (!(args->flags & SMU_MSG_FLAG_ASYNC))
+	/* Reset ACKs skipped the pre-poll, so only their own post-poll observes
+	 * the response. Mirror the wait-path carve-out: a slow reset must not
+	 * itself drive the streak to HANG with no reachable clear. A genuinely
+	 * wedged firmware is still caught by the next ordinary message's
+	 * pre-poll.
+	 */
+	if (!(args->flags & SMU_MSG_FLAG_ASYNC) &&
+	    (ret != -ETIME || !smu_msg_is_reset_ack(args->msg)))
 		__smu_msg_v1_etime_track(ctl, ret);
 
 	/* Read output args */

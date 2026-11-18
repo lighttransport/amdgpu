@@ -2028,10 +2028,15 @@ err_register_notifier:
 err_sb_client:
 	amdgpu_sb_client_del(process->sandbox_client);
 	WARN_ON_ONCE(svm_range_list_fini(process));
+err_init_apertures:
+	/* kfd_init_apertures can fail after creating some PDDs (e.g. a later
+	 * device fails or is skipped), leaving their kfd_processes_count refs
+	 * behind. Fall through the PDD cleanup so device teardown's
+	 * process_exit_wait cannot hang forever on a leaked count.
+	 */
 err_init_svm_range_list:
 	kfd_process_free_outstanding_kfd_bos(process);
 	kfd_process_destroy_pdds(process);
-err_init_apertures:
 	pqm_uninit(&process->pqm);
 err_process_pqm_init:
 	kfd_event_free_process(process);

@@ -123,7 +123,10 @@ uint32_t mqd_gfx_reserved_cu_mask(struct mqd_manager *mm, uint32_t *cu_mask,
 		return 0;
 	}
 
-	reserved = min_t(uint32_t, roundup((uint32_t)param, unit), active - unit);
+	/* Clamp before roundup: (uint32_t)INT_MAX rounded up to 2 wraps to 0. */
+	reserved = min_t(uint32_t,
+			 roundup(min_t(uint32_t, (uint32_t)param, active), unit),
+			 active - unit);
 	keep = rounddown(active - reserved, unit);
 	if (!keep)
 		return 0;

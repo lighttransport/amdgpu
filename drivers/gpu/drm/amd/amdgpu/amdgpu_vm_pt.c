@@ -29,6 +29,8 @@
 #include "amdgpu_vm_internal.h"
 #include "amdgpu_job.h"
 
+static void amdgpu_vm_pt_free(struct amdgpu_vm_bo_base *entry);
+
 /*
  * amdgpu_vm_pt_cursor - state for for_each_amdgpu_vm_pt
  */
@@ -531,7 +533,11 @@ static int amdgpu_vm_pt_alloc(struct amdgpu_device *adev,
 	return 0;
 
 error_free_pt:
-	amdgpu_bo_unref(&pt_bo);
+	/* entry->bo still points at pt_bo and is linked in the VM lists. Drop
+	 * the whole registration (stats, vm_bo, vm_status, ref) rather than
+	 * only unrefing the BO, which would leave a dangling entry.
+	 */
+	amdgpu_vm_pt_free(entry);
 	return r;
 }
 

@@ -2682,7 +2682,10 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 
 error_free_root:
 	amdgpu_vm_pt_free_root(adev, vm);
-	amdgpu_bo_unreserve(vm->root.bo);
+	/* free_root unrefs vm->root.bo and leaves it NULL; root_bo still holds
+	 * its own reference and reservation, so use that here.
+	 */
+	amdgpu_bo_unreserve(root_bo);
 	amdgpu_bo_unref(&root_bo);
 
 error_free_delayed:

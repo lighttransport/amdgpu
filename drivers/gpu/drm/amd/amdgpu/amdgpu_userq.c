@@ -796,6 +796,15 @@ amdgpu_userq_create_impl(struct drm_file *filp, union drm_amdgpu_userq *args)
 		 */
 		if (amdgpu_sb_check(queue->sandbox)) {
 			r = -EACCES;
+			/* Quarantine can also be triggered by a hang-detect fault
+			 * that bypasses sandbox_mutex, i.e. after map_helper has
+			 * already registered the queue in MES. Remove it before
+			 * mqd_destroy frees its backing; unmap_helper is a no-op
+			 * when the queue stayed UNMAPPED.
+			 */
+			down_read(&adev->reset_domain->sem);
+			amdgpu_userq_unmap_helper(queue);
+			up_read(&adev->reset_domain->sem);
 			drm_file_err(uq_mgr->file, "Queue quarantined during creation\n");
 			trace_amdgpu_userq_create_end(queue, r);
 			mutex_unlock(&uq_mgr->userq_mutex);

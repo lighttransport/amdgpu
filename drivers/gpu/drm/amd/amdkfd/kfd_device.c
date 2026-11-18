@@ -1027,8 +1027,8 @@ void kgd2kfd_device_exit(struct kfd_dev *kfd)
 	 * must be resumed just as kgd2kfd_resume_process() would do; otherwise
 	 * a removed suspended device leaves them evicted forever.
 	 */
-	was_suspended = kfd->suspend_count > 0 || kfd->reset_locked;
 	mutex_lock(&kfd_processes_mutex);
+	was_suspended = kfd->suspend_count > 0 || kfd->reset_locked;
 	kfd_locked -= kfd->suspend_count;
 	kfd->suspend_count = 0;
 	if (kfd->reset_locked) {

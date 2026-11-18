@@ -1219,19 +1219,12 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 		}
 	}
 
-	mqd_mgr->update_mqd(mqd_mgr, q->mqd, &q->properties, minfo);
-
-	/*
-	 * check active state vs. the previous state and modify
-	 * counter accordingly. map_queues_cpsch uses the
-	 * dqm->active_queue_count to determine whether a new runlist must be
-	 * uploaded.
+	/* Transition GWS state before programming the MQD. update_cu_mask()
+	 * reads q->properties.is_gws to decide between the full cooperative
+	 * mask and the graphics reservation; doing this after update_mqd()
+	 * left it with the stale value and programmed the wrong mask.
 	 */
-	if (q->properties.is_active && !prev_active) {
-		increment_queue_count(dqm, &pdd->qpd, q);
-	} else if (!q->properties.is_active && prev_active) {
-		decrement_queue_count(dqm, &pdd->qpd, q);
-	} else if (q->gws && !q->properties.is_gws) {
+	if (q->gws && !q->properties.is_gws) {
 		if (q->properties.is_active) {
 			dqm->gws_queue_count++;
 			pdd->qpd.mapped_gws_queue = true;
@@ -1243,6 +1236,20 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 			pdd->qpd.mapped_gws_queue = false;
 		}
 		q->properties.is_gws = false;
+	}
+
+	mqd_mgr->update_mqd(mqd_mgr, q->mqd, &q->properties, minfo);
+
+	/*
+	 * check active state vs. the previous state and modify
+	 * counter accordingly. map_queues_cpsch uses the
+	 * dqm->active_queue_count to determine whether a new runlist must be
+	 * uploaded. This is independent of the GWS accounting above.
+	 */
+	if (q->properties.is_active && !prev_active) {
+		increment_queue_count(dqm, &pdd->qpd, q);
+	} else if (!q->properties.is_active && prev_active) {
+		decrement_queue_count(dqm, &pdd->qpd, q);
 	}
 
 	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS) {

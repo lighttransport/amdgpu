@@ -193,6 +193,24 @@ svm_range_dma_map_dev(struct amdgpu_device *adev, struct svm_range *prange,
 
 	addr += offset;
 	pages += offset;
+
+	/* Pre-scan the whole batch before mutating any entry. The loop below
+	 * can return -EBUSY/-EIO partway through, which would leave dma_addr[]
+	 * and pages[] describing a mix of old and new backing while the GPU
+	 * PTEs still point at the old pages. Reject the batch up front instead.
+	 */
+	for (i = 0; i < npages; i++) {
+		page = hmm_pfn_to_page(hmm_pfns[i]);
+		if (is_zone_device_page(page)) {
+			if (test_bit(gpuidx, prange->bitmap_mapped) && pages[i])
+				return -EBUSY;
+		} else if (test_bit(gpuidx, prange->bitmap_mapped) &&
+			   (pages[i] != page ||
+			    !svm_is_valid_dma_mapping_addr(dev, addr[i]))) {
+			return -EBUSY;
+		}
+	}
+
 	for (i = 0; i < npages; i++) {
 		page = hmm_pfn_to_page(hmm_pfns[i]);
 		if (is_zone_device_page(page)) {
@@ -241,7 +259,10 @@ svm_range_dma_map_dev(struct amdgpu_device *adev, struct svm_range *prange,
 		r = dma_mapping_error(dev, addr[i]);
 		if (r) {
 			dev_err(dev, "failed %d dma_map_page\n", r);
-			return r;
+			/* dma_mapping_error may return a positive value on some
+			 * architectures; callers only test r < 0. Normalize it.
+			 */
+			return r > 0 ? -EIO : r;
 		}
 		pr_debug_ratelimited("dma mapping 0x%llx for page addr 0x%lx\n",
 				     addr[i] >> PAGE_SHIFT, page_to_pfn(page));
@@ -2736,6 +2757,13 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 						     pchild->work_item.op ==
 						     SVM_OP_UNMAP_RANGE);
 			if (r) {
+				/* handle_list_op failed before freeing the child.
+				 * Relink it so the parent's retry drain sees it
+				 * again instead of leaking an unowned range with
+				 * a live notifier and sandbox range.
+				 */
+				list_add_tail(&pchild->child_list,
+					      &prange->child_list);
 				ret = r;
 				break;
 			}

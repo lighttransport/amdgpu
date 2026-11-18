@@ -517,7 +517,9 @@ static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 static bool smu_msg_is_reset_ack(u32 msg)
 {
 	return msg == SMU_MSG_DriverMode2Reset ||
-	       msg == SMU_MSG_GfxDeviceDriverReset;
+	       msg == SMU_MSG_GfxDeviceDriverReset ||
+	       msg == SMU_MSG_GfxDriverResetRecovery ||
+	       msg == SMU_MSG_Mode2Reset;
 }
 
 /**
@@ -585,6 +587,14 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 		ctl->timeout_streak = 0;
 		ctl->last_msg = SMU_MSG_MAX_COUNT;
 	}
+
+	/* A hung firmware leaves the response register at SMU_RESP_NONE. The
+	 * normal pre-poll would treat that as a fatal stall and never write the
+	 * reset command, defeating the hang-gate bypass above. Reset/ACK
+	 * messages must be sent unconditionally, matching NO_PRECHECK mappings.
+	 */
+	if (smu_msg_is_reset_ack(args->msg))
+		skip_pre_poll = true;
 
 	/* Pre-poll: ensure previous message completed */
 	if (!skip_pre_poll) {

@@ -30,7 +30,7 @@ prefix = r'''
 #include <errno.h>
 typedef uint32_t u32;
 typedef uint16_t u16;
-enum smu_message_type { TEST_MSG, SMU_MSG_DriverMode2Reset, SMU_MSG_GfxDeviceDriverReset, SMU_MSG_MAX_COUNT };
+enum smu_message_type { TEST_MSG, SMU_MSG_DriverMode2Reset, SMU_MSG_GfxDeviceDriverReset, SMU_MSG_GfxDriverResetRecovery, SMU_MSG_Mode2Reset, SMU_MSG_MAX_COUNT };
 enum { SMU_FW_INIT, SMU_FW_RUNTIME, SMU_FW_HANG };
 #define SMU_RESP_NONE 0
 #define SMU_RESP_OK 1

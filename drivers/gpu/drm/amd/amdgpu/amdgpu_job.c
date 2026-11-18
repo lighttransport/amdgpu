@@ -215,8 +215,14 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 			if (!down_read_trylock(&adev->reset_domain->sem))
 				goto exit;
 			reset_domain_locked = true;
-			if (amdgpu_device_bus_status_check(adev))
+			if (amdgpu_device_bus_status_check(adev)) {
+				/* Completion may have raced the recovery attempts
+				 * before this probe; do not park a finished job.
+				 */
+				if (dma_fence_is_signaled(&s_job->s_fence->finished))
+					goto exit;
 				goto device_lost;
+			}
 			up_read(&adev->reset_domain->sem);
 			reset_domain_locked = false;
 		}

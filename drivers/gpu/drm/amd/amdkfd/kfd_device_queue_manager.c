@@ -1225,13 +1225,20 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 	 * left it with the stale value and programmed the wrong mask.
 	 */
 	if (q->gws && !q->properties.is_gws) {
-		if (q->properties.is_active) {
+		/* Only account here when the active state is unchanged. If it
+		 * changes in the same call, increment/decrement_queue_count()
+		 * below accounts GWS using the new is_gws value; doing both
+		 * would double-count.
+		 */
+		if (q->properties.is_active &&
+		    q->properties.is_active == prev_active) {
 			dqm->gws_queue_count++;
 			pdd->qpd.mapped_gws_queue = true;
 		}
 		q->properties.is_gws = true;
 	} else if (!q->gws && q->properties.is_gws) {
-		if (q->properties.is_active) {
+		if (q->properties.is_active &&
+		    q->properties.is_active == prev_active) {
 			dqm->gws_queue_count--;
 			pdd->qpd.mapped_gws_queue = false;
 		}
@@ -1244,7 +1251,8 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 	 * check active state vs. the previous state and modify
 	 * counter accordingly. map_queues_cpsch uses the
 	 * dqm->active_queue_count to determine whether a new runlist must be
-	 * uploaded. This is independent of the GWS accounting above.
+	 * uploaded. GWS accounting here covers the active-state-change case
+	 * that the transition block above deliberately leaves out.
 	 */
 	if (q->properties.is_active && !prev_active) {
 		increment_queue_count(dqm, &pdd->qpd, q);

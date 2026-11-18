@@ -411,7 +411,9 @@ static void sb_quarantine_work(struct work_struct *work)
 	mutex_unlock(&sb->clients_lock);
 	retry = count && !snapshot;
 	if (retry)
-		sb_event(sb, AMDGPU_SB_EVENT_QUARANTINE, 0, -ENOMEM, 0);
+		/* value carries the positive errno magnitude (like -ret below);
+		 * sb_event's value is u64, so a negative would sign-extend. */
+		sb_event(sb, AMDGPU_SB_EVENT_QUARANTINE, 0, ENOMEM, 0);
 	for (i = 0; i < n; i++) {
 		int ret = 0;
 

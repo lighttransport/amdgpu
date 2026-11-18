@@ -727,7 +727,12 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 		/* DQM has retired the queue. Preserve mapping protections until
 		 * this point, including across failed destroy attempts.
 		 */
-		WARN_ON(kfd_queue_unref_bo_vas(pdd, &pqn->q->properties));
+		retval = kfd_queue_unref_bo_vas(pdd, &pqn->q->properties);
+		if (retval) {
+			pr_err("Pasid 0x%x unref queue %d BO VAs failed %d; retaining queue\n",
+			       pdd->pasid, pqn->q->properties.queue_id, retval);
+			goto err_destroy_queue;
+		}
 		kfd_procfs_del_queue(pqn->q);
 		kfd_queue_release_buffers(pdd, &pqn->q->properties);
 		pqm_clean_queue_resource(pqm, pqn);
@@ -1309,6 +1314,12 @@ int kfd_process_get_queue_info(struct kfd_process *p,
 		struct kfd_process_device *pdd = p->pdds[i];
 
 		list_for_each_entry(q, &pdd->qpd.queues_list, list) {
+			/* Retained failed creations are setup-only and are not
+			 * visible to PQM lookup; do not enumerate them for CRIU
+			 * or the checkpoint would fail mid-way with -EFAULT.
+			 */
+			if (q->properties.is_create_failed)
+				continue;
 			if (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
 				q->properties.type == KFD_QUEUE_TYPE_SDMA ||
 				q->properties.type == KFD_QUEUE_TYPE_SDMA_XGMI) {

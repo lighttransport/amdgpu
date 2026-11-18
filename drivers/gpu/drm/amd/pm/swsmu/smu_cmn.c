@@ -645,6 +645,15 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	if (ret == -EREMOTEIO) {
 		smu->smc_fw_state = SMU_FW_HANG;
 		__smu_msg_v1_print_error(ctl, reg, args);
+	} else if (ret == 0 && smu_msg_is_reset_ack(args->msg) &&
+		 smu->smc_fw_state == SMU_FW_HANG) {
+		/* Some reset ACKs are sent only synchronously (e.g.
+		 * GfxDriverResetRecovery / Mode2Reset), so the clearing in
+		 * wait_response never runs for them. Clear here too, otherwise
+		 * a successful reset still leaves ordinary messages blocked.
+		 */
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
 	} else if (ret != 0) {
 		__smu_msg_v1_print_error(ctl, reg, args);
 	}
@@ -721,9 +730,7 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 	 * must not prevent a later poll from observing reset completion.
 	 * A subsequent send still applies the normal pre-poll policy.
 	 */
-	else if (ret != -ETIME ||
-		 (ctl->last_msg != SMU_MSG_DriverMode2Reset &&
-		  ctl->last_msg != SMU_MSG_GfxDeviceDriverReset))
+	else if (ret != -ETIME || !smu_msg_is_reset_ack(ctl->last_msg))
 		__smu_msg_v1_etime_track(ctl, ret);
 
 	smu_lte_trace(ctl, "wait-end", ctl->last_msg, 0, reg, ret, timeout_us);

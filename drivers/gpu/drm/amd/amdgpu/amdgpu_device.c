@@ -5347,32 +5347,26 @@ int amdgpu_do_asic_reset(struct list_head *device_list_handle,
 	 * to allow proper links negotiation in FW (within 1 sec)
 	 */
 	if (!skip_hw_reset && need_full_reset) {
-		/* Queue every XGMI worker first. They synchronize with a hive
-		 * task barrier that counts all members; breaking out of a single
-		 * mixed loop on an error could queue only part of the hive and
-		 * strand the already-queued workers at the barrier, making the
-		 * flush below hang forever.
+		/* Reset every device in order, recording the first error but never
+		 * breaking early: XGMI workers synchronize with a hive task
+		 * barrier counting all members, so stopping after a failure could
+		 * leave already-queued workers stranded at the barrier and make
+		 * the flush below hang.
 		 */
 		list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
-			if (tmp_adev->gmc.xgmi.num_physical_nodes > 1 &&
-			    !queue_work(system_dfl_wq,
-					&tmp_adev->xgmi_reset_work))
-				r = -EALREADY;
-		}
-
-		/* Non-XGMI devices reset in-line. Record the first error but keep
-		 * going so every XGMI worker is joined below.
-		 */
-		list_for_each_entry(tmp_adev, device_list_handle, reset_list) {
-			if (tmp_adev->gmc.xgmi.num_physical_nodes > 1)
-				continue;
-			tmp_r = amdgpu_asic_reset(tmp_adev);
-			if (tmp_r) {
-				dev_err(tmp_adev->dev,
-					"ASIC reset failed with error, %d for drm dev, %s",
-					tmp_r, adev_to_drm(tmp_adev)->unique);
-				if (!r)
-					r = tmp_r;
+			if (tmp_adev->gmc.xgmi.num_physical_nodes > 1) {
+				if (!queue_work(system_dfl_wq,
+						&tmp_adev->xgmi_reset_work) && !r)
+					r = -EALREADY;
+			} else {
+				tmp_r = amdgpu_asic_reset(tmp_adev);
+				if (tmp_r) {
+					dev_err(tmp_adev->dev,
+						"ASIC reset failed with error, %d for drm dev, %s",
+						tmp_r, adev_to_drm(tmp_adev)->unique);
+					if (!r)
+						r = tmp_r;
+				}
 			}
 		}
 
@@ -5704,11 +5698,7 @@ static int amdgpu_device_sched_resume(struct list_head *device_list,
 	struct amdgpu_device *tmp_adev = NULL;
 	int i, r = 0;
 
-	/* Post ASIC reset for all devs. Wake only devices whose own reset
-	 * succeeded: a failed device keeps its schedulers parked, but healthy
-	 * siblings must not be left stopped just because another device in the
-	 * hive failed. The overall error is still returned to the caller.
-	 */
+	/* Post ASIC reset for all devs .*/
 	list_for_each_entry(tmp_adev, device_list, reset_list) {
 		if (tmp_adev->asic_reset_res) {
 			/* PCI recovery has no reset context. */
@@ -5725,27 +5715,30 @@ static int amdgpu_device_sched_resume(struct list_head *device_list,
 					    tmp_adev->asic_reset_res);
 			if (!r)
 				r = tmp_adev->asic_reset_res;
-		} else {
-			for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
-				struct amdgpu_ring *ring = tmp_adev->rings[i];
-
-				if (!amdgpu_ring_sched_ready(ring))
-					continue;
-
-				drm_sched_wqueue_start(&ring->sched);
-			}
-
-			if (!drm_drv_uses_atomic_modeset(adev_to_drm(tmp_adev)) &&
-			    !job_signaled)
-				drm_helper_resume_force_mode(adev_to_drm(tmp_adev));
-
-			dev_info(tmp_adev->dev, "GPU reset(%d) succeeded!\n",
-				 atomic_read(&tmp_adev->gpu_reset_counter));
-			if (amdgpu_acpi_smart_shift_update(tmp_adev,
-							   AMDGPU_SS_DEV_D0))
-				dev_warn(tmp_adev->dev,
-					 "smart shift update failed\n");
 		}
+	}
+	if (r)
+		return r;
+
+	list_for_each_entry(tmp_adev, device_list, reset_list) {
+		for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+			struct amdgpu_ring *ring = tmp_adev->rings[i];
+
+			if (!amdgpu_ring_sched_ready(ring))
+				continue;
+
+			drm_sched_wqueue_start(&ring->sched);
+		}
+
+		if (!drm_drv_uses_atomic_modeset(adev_to_drm(tmp_adev)) && !job_signaled)
+			drm_helper_resume_force_mode(adev_to_drm(tmp_adev));
+
+		dev_info(tmp_adev->dev, "GPU reset(%d) succeeded!\n",
+			 atomic_read(&tmp_adev->gpu_reset_counter));
+		if (amdgpu_acpi_smart_shift_update(tmp_adev,
+						   AMDGPU_SS_DEV_D0))
+			dev_warn(tmp_adev->dev,
+				 "smart shift update failed\n");
 	}
 
 	return r;

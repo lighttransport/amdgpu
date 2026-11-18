@@ -411,7 +411,7 @@ static void sb_quarantine_work(struct work_struct *work)
 	mutex_unlock(&sb->clients_lock);
 	retry = count && !snapshot;
 	if (retry)
-		sb_event(sb, AMDGPU_SB_EVENT_QUARANTINE, 0, ENOMEM, 0);
+		sb_event(sb, AMDGPU_SB_EVENT_QUARANTINE, 0, -ENOMEM, 0);
 	for (i = 0; i < n; i++) {
 		int ret = 0;
 
@@ -894,6 +894,11 @@ static __poll_t sb_poll(struct file *file, poll_table *wait)
 {
 	struct sb_reader *reader = file->private_data;
 
+	/* Match the capability check in open/read/ioctl; a passed fd must not
+	 * become an event existence/timing channel after caps are dropped.
+	 */
+	if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
+		return 0;
 	poll_wait(file, &sb_event_wait, wait);
 	return READ_ONCE(sb_event_sequence) >= READ_ONCE(reader->cursor) ?
 		EPOLLIN | EPOLLRDNORM : 0;
@@ -921,8 +926,10 @@ int amdgpu_sb_init(void)
 	if (!sb_wq)
 		return -ENOMEM;
 	ret = misc_register(&sb_misc);
-	if (ret)
+	if (ret) {
 		destroy_workqueue(sb_wq);
+		sb_wq = NULL;
+	}
 	return ret;
 }
 

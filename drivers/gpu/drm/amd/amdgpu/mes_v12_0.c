@@ -2241,6 +2241,9 @@ static int mes_v12_0_hw_init(struct amdgpu_ip_block *ip_block)
 	/* Enable the MES to handle doorbell ring on unmapped queue */
 	mes_v12_0_enable_unmapped_doorbell_handling(&adev->mes, true);
 
+	/* Firmware queue state from before this point is gone. */
+	atomic_inc(&adev->mes.fw_generation);
+
 	r = mes_v12_0_queue_init(adev, AMDGPU_MES_SCHED_PIPE);
 	if (r)
 		goto failure;

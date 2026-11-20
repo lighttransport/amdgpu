@@ -48,7 +48,10 @@ struct amdgpu_userq_obj {
 	struct amdgpu_bo *obj;
 };
 
+struct amdgpu_sandbox;
+
 struct amdgpu_usermode_queue {
+	struct amdgpu_sandbox *sandbox;
 	int			queue_type;
 	enum amdgpu_userq_state state;
 	uint64_t		doorbell_handle;
@@ -119,6 +122,8 @@ struct amdgpu_userq_funcs {
 
 /* Usermode queues for gfx */
 struct amdgpu_userq_mgr {
+	/* Serializes sandbox quarantine with complete queue construction. */
+	struct mutex sandbox_mutex;
 	/**
 	 * @userq_xa: Per-process user queue map (queue ID → queue)
 	 * Key: queue_id (unique ID within the process's userq manager)
@@ -163,6 +168,7 @@ void amdgpu_userq_mgr_cancel_resume(struct amdgpu_userq_mgr *userq_mgr);
 void amdgpu_userq_mgr_fini(struct amdgpu_userq_mgr *userq_mgr);
 
 void amdgpu_userq_wait_for_signal(struct amdgpu_userq_mgr *uq_mgr);
+int amdgpu_userq_sandbox_quarantine(struct amdgpu_userq_mgr *uq_mgr);
 void amdgpu_userq_evict(struct amdgpu_userq_mgr *uq_mgr);
 
 void amdgpu_userq_ensure_ev_fence(struct amdgpu_userq_mgr *userq_mgr,

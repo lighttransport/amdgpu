@@ -173,6 +173,8 @@ struct kfd_mem_obj *allocate_sdma_mqd(struct mqd_manager *mm,
 void free_mqd_hiq_sdma(struct mqd_manager *mm, void *mqd,
 				struct kfd_mem_obj *mqd_mem_obj);
 
+uint32_t mqd_gfx_reserved_cu_mask(struct mqd_manager *mm, uint32_t *cu_mask,
+				  uint32_t words);
 void mqd_symmetrically_map_cu_mask(struct mqd_manager *mm,
 		const uint32_t *cu_mask, uint32_t cu_mask_count,
 		uint32_t *se_mask, uint32_t inst);

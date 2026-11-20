@@ -29,6 +29,8 @@
 #include "amdgpu_vm_internal.h"
 #include "amdgpu_job.h"
 
+static void amdgpu_vm_pt_free(struct amdgpu_vm_bo_base *entry);
+
 /*
  * amdgpu_vm_pt_cursor - state for for_each_amdgpu_vm_pt
  */
@@ -442,16 +444,20 @@ exit:
  * @immediate: use a immediate update
  * @vmbo: pointer to the buffer object pointer
  * @xcp_id: GPU partition id
+ * @sandbox: policy owner held by the file or root page directory
  */
 int amdgpu_vm_pt_create(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 			int level, bool immediate, struct amdgpu_bo_vm **vmbo,
-			int32_t xcp_id)
+			int32_t xcp_id, struct amdgpu_sandbox *sandbox)
 {
 	struct amdgpu_bo_param bp;
 	unsigned int num_entries;
 	int r;
 
 	memset(&bp, 0, sizeof(bp));
+	/* Per-client page tables remain owned even when created by a worker. */
+	bp.sandbox = sandbox;
+	bp.sandbox_explicit = true;
 
 	bp.size = amdgpu_vm_pt_size(adev, level);
 	bp.byte_align = AMDGPU_GPU_PAGE_SIZE;
@@ -527,7 +533,7 @@ static int amdgpu_vm_pt_alloc(struct amdgpu_vm_update_params *p,
 
 	amdgpu_vm_end_critical(p);
 	r = amdgpu_vm_pt_create(p->adev, p->vm, cursor->level, p->immediate,
-				&pt, p->vm->root.bo->xcp_id);
+				&pt, p->vm->root.bo->xcp_id, p->vm->root.bo->sandbox);
 	r2 = amdgpu_vm_begin_critical(p);
 	if (r)
 		return r;
@@ -550,7 +556,11 @@ error_unpin:
 	if (p->vm->is_npa)
 		amdgpu_bo_unpin(pt_bo);
 error_free_pt:
-	amdgpu_bo_unref(&pt_bo);
+	/* entry->bo still points at pt_bo and is linked in the VM lists. Drop
+	 * the whole registration (stats, vm_bo, vm_status, ref) rather than
+	 * only unrefing the BO, which would leave a dangling entry.
+	 */
+	amdgpu_vm_pt_free(entry);
 	return r;
 }
 

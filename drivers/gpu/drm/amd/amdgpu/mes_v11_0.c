@@ -2105,6 +2105,9 @@ static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block)
 		mes_v11_0_enable(adev, true);
 	}
 
+	/* Firmware queue state from before this point is gone. */
+	atomic_inc(&adev->mes.fw_generation);
+
 	r = mes_v11_0_queue_init(adev, AMDGPU_MES_SCHED_PIPE);
 	if (r)
 		goto failure;

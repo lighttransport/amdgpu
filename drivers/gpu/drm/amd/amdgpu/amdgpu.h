@@ -232,6 +232,10 @@ extern int amdgpu_mtype_local;
 extern int amdgpu_mtype_remote;
 extern int amdgpu_enforce_isolation;
 extern uint amdgpu_debug_mask;
+extern uint amdgpu_lte_debug;
+#define AMDGPU_LTE_DEBUG_SMU BIT(0)
+#define AMDGPU_LTE_DEBUG_PM BIT(1)
+#define AMDGPU_LTE_DEBUG_PPT BIT(2)
 #ifdef CONFIG_HSA_AMD
 extern int sched_policy;
 extern bool debug_evictions;
@@ -413,7 +417,12 @@ struct amdgpu_flip_work {
  * file private structure
  */
 
+struct amdgpu_sandbox;
+struct amdgpu_sb_client;
+
 struct amdgpu_fpriv {
+	struct amdgpu_sandbox *sandbox;
+	struct amdgpu_sb_client *sandbox_client;
 	struct amdgpu_vm	vm;
 	struct amdgpu_bo_va	*prt_va;
 	struct amdgpu_bo_va	*csa_va;

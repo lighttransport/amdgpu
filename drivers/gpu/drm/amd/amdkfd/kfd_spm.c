@@ -334,10 +334,10 @@ static int _kfd_acquire_spm(struct kfd_process_device *pdd, int inst, struct amd
 	spm->ring_size = order_base_2(4 * 1024 * 1024/4);
 	spm->ring_size = (1 << spm->ring_size) * 4;
 
-	ret = amdgpu_amdkfd_alloc_kernel_mem(adev,
+	ret = amdgpu_amdkfd_alloc_kernel_mem_owned(adev,
 			spm->ring_size, AMDGPU_GEM_DOMAIN_GTT, &spm->spm_obj,
 			&spm->gpu_addr, (void *)&spm->cpu_addr,
-			false, false);
+			false, false, pdd->process->sandbox);
 
 	if (ret)
 		goto out;

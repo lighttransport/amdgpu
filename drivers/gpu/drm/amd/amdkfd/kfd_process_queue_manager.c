@@ -23,6 +23,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/dma-fence.h>
 #include <linux/list.h>
 #include <linux/cred.h>		/* current_cred, __task_cred, uid_eq, gid_eq */
 #include <linux/capability.h>	/* perfmon_capable, ns_capable, CAP_SYS_PTRACE */
@@ -32,14 +33,15 @@
 #include <linux/sched/coredump.h>	/* get_dumpable, SUID_DUMP_USER */
 #include "kfd_device_queue_manager.h"
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_kernel_queue.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_object.h"	/* amdgpu_bo */
 #include "amdgpu_vm.h"		/* drm_priv_to_vm */
 #include "amdgpu_reset.h"
 
-static inline struct process_queue_node *get_queue_by_qid(
-			struct process_queue_manager *pqm, unsigned int qid)
+static inline struct process_queue_node *
+get_queue_by_qid_for_cleanup(struct process_queue_manager *pqm, unsigned int qid)
 {
 	struct process_queue_node *pqn;
 
@@ -50,6 +52,17 @@ static inline struct process_queue_node *get_queue_by_qid(
 	}
 
 	return NULL;
+}
+
+/* Failed creations are cleanup-only: do not expose them to queue updates. */
+static inline struct process_queue_node *
+get_queue_by_qid(struct process_queue_manager *pqm, unsigned int qid)
+{
+	struct process_queue_node *pqn = get_queue_by_qid_for_cleanup(pqm, qid);
+
+	if (pqn && pqn->q && pqn->q->properties.is_create_failed)
+		return NULL;
+	return pqn;
 }
 
 static int assign_queue_slot_by_qid(struct process_queue_manager *pqm,
@@ -265,27 +278,35 @@ static int init_user_queue(struct process_queue_manager *pqm,
 	/* let DQM handle it*/
 	q_properties->vmid = 0;
 	q_properties->queue_id = qid;
+	q_properties->sandbox = pqm->process->sandbox;
 
 	retval = init_queue(q, q_properties);
 	if (retval != 0)
 		return retval;
 
+	retval = amdgpu_sb_charge(pqm->process->sandbox, AMDGPU_SB_QUEUES, 1);
+	if (retval)
+		goto cleanup;
+	(*q)->sandbox = amdgpu_sb_get(pqm->process->sandbox);
+	if ((*q)->sandbox)
+		(*q)->sandbox_context = dma_fence_context_alloc(1);
 	(*q)->device = dev;
 	(*q)->process = pqm->process;
 
 	if (dev->kfd->shared_resources.enable_mes) {
 		if (!q_properties->wptr_bo) {
 			pr_debug("Queue initialization with shared MES requires queue buffers to be initialized\n");
-			return -EINVAL;
+			retval = -EINVAL;
+			goto cleanup;
 		}
 
-		retval = amdgpu_amdkfd_alloc_kernel_mem(dev->adev,
+		retval = amdgpu_amdkfd_alloc_kernel_mem_owned(dev->adev,
 						AMDGPU_MES_GANG_CTX_SIZE,
 						AMDGPU_GEM_DOMAIN_GTT,
 						&(*q)->gang_ctx_bo,
 						&(*q)->gang_ctx_gpu_addr,
 						&(*q)->gang_ctx_cpu_ptr,
-						false, true);
+						false, true, pqm->process->sandbox);
 		if (retval) {
 			pr_err("failed to allocate gang context bo\n");
 			goto cleanup;
@@ -297,7 +318,7 @@ static int init_user_queue(struct process_queue_manager *pqm,
 						&(*q)->gang_ctx_array_index);
 			if (retval) {
 				pr_err("failed to allocate gang context index slot\n");
-				goto cleanup;
+				goto free_gang_ctx_bo_only;
 			}
 		}
 		/* Starting with GFX11, wptr BOs must be mapped to GART for MES to determine work
@@ -322,6 +343,7 @@ static int init_user_queue(struct process_queue_manager *pqm,
 
 free_gang_ctx_bo:
 	amdgpu_mes_free_gang_ctx_index(&dev->adev->mes, (*q)->gang_ctx_array_index);
+free_gang_ctx_bo_only:
 	amdgpu_amdkfd_free_kernel_mem(dev->adev, &(*q)->gang_ctx_bo);
 cleanup:
 	uninit_queue(*q);
@@ -461,6 +483,8 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 	    KFD_GC_VERSION(dev) == IP_VERSION(12, 1, 0))
 		max_queues = 255;
 
+	/* Output ownership marker is false on every pre-submission failure. */
+	properties->is_create_failed = false;
 	q = NULL;
 	kq = NULL;
 
@@ -498,13 +522,13 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 
 	/* Allocate proc_ctx_bo only if MES is enabled and this is the first queue */
 	if (!pdd->proc_ctx_cpu_ptr && dev->kfd->shared_resources.enable_mes) {
-		retval = amdgpu_amdkfd_alloc_kernel_mem(dev->adev,
+		retval = amdgpu_amdkfd_alloc_kernel_mem_owned(dev->adev,
 						     AMDGPU_MES_PROC_CTX_SIZE,
 						     AMDGPU_GEM_DOMAIN_GTT,
 						     &pdd->proc_ctx_bo,
 						     &pdd->proc_ctx_gpu_addr,
 						     &pdd->proc_ctx_cpu_ptr,
-						     false, true);
+						     false, true, pqm->process->sandbox);
 		if (retval) {
 			dev_err(dev->adev->dev, "failed to allocate process context bo\n");
 			goto err_allocate_pqn;
@@ -589,6 +613,11 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 		else
 			pr_err("process pid %d DQM create queue type %d failed. ret %d\n",
 				pqm->process->lead_thread->pid, type, retval);
+		if (q && q->properties.is_create_failed) {
+			/* Transfer buffer/mapping ownership even though create failed. */
+			properties->is_create_failed = true;
+			goto retain_queue;
+		}
 		goto err_create_queue;
 	}
 
@@ -610,6 +639,7 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 
 	pr_debug("PQM After DQM create queue\n");
 
+retain_queue:
 	list_add(&pqn->process_queue_list, &pqm->queues);
 
 	if (q) {
@@ -618,12 +648,14 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 		print_queue_properties(&q->properties);
 	}
 
-	if (pqn->q)
+	if (!retval && pqn->q)
 		kfd_dispatch_log_autoarm_queue(pqm->process, pqn->q);
 
 	return retval;
 
 err_create_queue:
+	if (q)
+		pqm_clean_queue_resource(pqm, pqn);
 	uninit_queue(q);
 	if (kq)
 		kernel_queue_uninit(kq);
@@ -650,7 +682,7 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 
 	retval = 0;
 
-	pqn = get_queue_by_qid(pqm, qid);
+	pqn = get_queue_by_qid_for_cleanup(pqm, qid);
 	if (!pqn) {
 		pr_err("Queue id does not match any known queue\n");
 		return -EINVAL;
@@ -685,10 +717,6 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 		notify_dlog = pqn->q->properties.type == KFD_QUEUE_TYPE_COMPUTE &&
 			      pqn->q->properties.dispatch_record_buffer_addr;
 
-		retval = kfd_queue_unref_bo_vas(pdd, &pqn->q->properties);
-		if (retval)
-			goto err_destroy_queue;
-
 		dqm = pqn->q->device->dqm;
 		retval = dqm->ops.destroy_queue(dqm, &pdd->qpd, pqn->q);
 
@@ -699,8 +727,24 @@ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid)
 			pr_err("Pasid 0x%x destroy queue %d failed, ret %d\n",
 				pdd->pasid,
 				pqn->q->properties.queue_id, retval);
+			/* A failed MES removal leaves the DQM queue linked and its
+			 * resources live. Do not free its PQM owner on a tolerated
+			 * timeout when the DQM aborted destruction.
+			 */
+			if (dev->kfd->shared_resources.enable_mes &&
+			    !pqn->q->properties.is_being_destroyed)
+				goto err_destroy_queue;
 			if (retval != -ETIME && retval != -EIO)
 				goto err_destroy_queue;
+		}
+		/* DQM has retired the queue. Preserve mapping protections until
+		 * this point, including across failed destroy attempts.
+		 */
+		retval = kfd_queue_unref_bo_vas(pdd, &pqn->q->properties);
+		if (retval) {
+			pr_err("Pasid 0x%x unref queue %d BO VAs failed %d; retaining queue\n",
+			       pdd->pasid, pqn->q->properties.queue_id, retval);
+			goto err_destroy_queue;
 		}
 		kfd_procfs_del_queue(pqn->q);
 		kfd_queue_release_buffers(pdd, &pqn->q->properties);
@@ -1169,13 +1213,18 @@ int pqm_update_mqd(struct process_queue_manager *pqm,
 		}
 	}
 
+	/*
+	 * Record the user mask before the update: update_queue can fail after
+	 * the MQD already holds it, and later mask-less updates must not then
+	 * replace it with the default graphics reservation.
+	 */
+	if (minfo && minfo->cu_mask.ptr)
+		pqn->q->properties.is_user_cu_masked = true;
+
 	retval = pqn->q->device->dqm->ops.update_queue(pqn->q->device->dqm,
 							pqn->q, minfo);
 	if (retval != 0)
 		return retval;
-
-	if (minfo && minfo->cu_mask.ptr)
-		pqn->q->properties.is_user_cu_masked = true;
 
 	return 0;
 }
@@ -1284,6 +1333,12 @@ int kfd_process_get_queue_info(struct kfd_process *p,
 		struct kfd_process_device *pdd = p->pdds[i];
 
 		list_for_each_entry(q, &pdd->qpd.queues_list, list) {
+			/* Retained failed creations are setup-only and are not
+			 * visible to PQM lookup; do not enumerate them for CRIU
+			 * or the checkpoint would fail mid-way with -EFAULT.
+			 */
+			if (q->properties.is_create_failed)
+				continue;
 			if (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
 				q->properties.type == KFD_QUEUE_TYPE_SDMA ||
 				q->properties.type == KFD_QUEUE_TYPE_SDMA_XGMI) {
@@ -1478,7 +1533,7 @@ static void set_queue_properties_from_criu(struct queue_properties *qp,
 {
 	qp->is_interop = false;
 	qp->queue_percent = q_data->q_percent;
-	qp->priority = q_data->priority;
+	qp->priority = kfd_cap_queue_priority(q_data->priority);
 	qp->queue_address = q_data->q_address;
 	qp->queue_size = q_data->q_size;
 	qp->read_ptr = (void __user *)q_data->read_ptr_addr;
@@ -1535,6 +1590,13 @@ int kfd_criu_restore_queue(struct kfd_process *p,
 	}
 
 	if (q_data->mqd_size != mqd_size_from_queue_type(pdd->dev->dqm, q_data->type)) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	/* Checkpoint data is user supplied; MQD setup indexes pipe_priority_map. */
+	if (q_data->priority > KFD_MAX_QUEUE_PRIORITY) {
+		pr_err("CRIU queue priority %u out of range\n", q_data->priority);
 		ret = -EINVAL;
 		goto exit;
 	}

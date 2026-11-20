@@ -83,10 +83,35 @@ out:
 	return ret;
 }
 
+static ssize_t kfd_debugfs_qstate_write(struct file *file,
+	const char __user *user_buf, size_t size, loff_t *ppos)
+{
+	char tmp[16] = {};
+	int pid, r;
+
+	if (size >= sizeof(tmp))
+		return -EINVAL;
+	if (copy_from_user(tmp, user_buf, size))
+		return -EFAULT;
+	if (kstrtoint(strim(tmp), 10, &pid) || pid <= 0)
+		return -EINVAL;
+	r = kfd_debugfs_qstate_repair(pid);
+	return r < 0 ? r : size;
+}
+
 static const struct file_operations kfd_debugfs_fops = {
 	.owner = THIS_MODULE,
 	.open = kfd_debugfs_open,
 	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static const struct file_operations kfd_debugfs_qstate_fops = {
+	.owner = THIS_MODULE,
+	.open = kfd_debugfs_open,
+	.read = seq_read,
+	.write = kfd_debugfs_qstate_write,
 	.llseek = seq_lseek,
 	.release = single_release,
 };
@@ -110,6 +135,8 @@ void kfd_debugfs_init(void)
 			    kfd_debugfs_mqds_by_process, &kfd_debugfs_fops);
 	debugfs_create_file("hqds", S_IFREG | 0444, debugfs_root,
 			    kfd_debugfs_hqds_by_device, &kfd_debugfs_fops);
+	debugfs_create_file("queue_state", S_IFREG | 0644, debugfs_root,
+			    kfd_debugfs_qstate_by_process, &kfd_debugfs_qstate_fops);
 	debugfs_create_file("rls", S_IFREG | 0444, debugfs_root,
 			    kfd_debugfs_rls_by_device, &kfd_debugfs_fops);
 	debugfs_create_file("hang_hws", S_IFREG | 0200, debugfs_root,

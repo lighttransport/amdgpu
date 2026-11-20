@@ -22,7 +22,11 @@
 
 #define SWSMU_CODE_LAYER_L4
 
+#include <linux/delay.h>
+#include <linux/moduleparam.h>
+
 #include "amdgpu.h"
+#include "amdgpu_lte_debug.h"
 #include "amdgpu_smu.h"
 #include "smu_cmn.h"
 #include "soc15_common.h"
@@ -82,6 +86,20 @@ static const char * const __smu_message_names[] = {
 #define SMU_MSG_V1_DEFAULT_RATELIMIT_INTERVAL (5 * HZ)
 #define SMU_MSG_V1_DEFAULT_RATELIMIT_BURST 10
 
+/*
+ * LTE hardening: bounded retry for SMU_RESP_BUSY_OTHER ("I'm very busy"),
+ * whose documented client behavior is to retry in 10 us. A single busy
+ * response must not fail a power/clock write while the PMFW is making a
+ * transition.
+ */
+#define SMU_MSG_V1_BUSY_RETRIES		3
+
+/* Zero disables timeout escalation; read-only to keep a streak's policy fixed. */
+static unsigned int smu_etime_streak = 3;
+module_param_named(smu_etime_streak, smu_etime_streak, uint, 0444);
+MODULE_PARM_DESC(smu_etime_streak,
+		 "Consecutive SMU response timeouts before fail-fast (default 3, 0 disables)");
+
 static const char *smu_get_message_name(struct smu_context *smu,
 					enum smu_message_type type)
 {
@@ -89,6 +107,27 @@ static const char *smu_get_message_name(struct smu_context *smu,
 		return "unknown smu message";
 
 	return __smu_message_names[type];
+}
+
+/* Only cached state is traced: never read MMIO just for diagnostics. */
+static void smu_lte_trace(struct smu_msg_ctl *ctl, const char *phase,
+			  enum smu_message_type msg, u32 param, u32 resp,
+			  int ret, u32 timeout)
+{
+	u32 index = U32_MAX;
+
+	if (!(amdgpu_lte_debug & AMDGPU_LTE_DEBUG_SMU) ||
+	    !trace_amdgpu_lte_smu_enabled())
+		return;
+
+	if (msg < SMU_MSG_MAX_COUNT && ctl->message_map &&
+	    ctl->message_map[msg].valid_mapping)
+		index = ctl->message_map[msg].map_to;
+	trace_amdgpu_lte_smu(ctl->smu->adev, phase,
+			     smu_get_message_name(ctl->smu, msg), index,
+			     param, resp, ret, ctl->smu->smc_fw_state,
+			     ctl->timeout_streak,
+			     timeout ? timeout : ctl->default_timeout);
 }
 
 /* Redefine the SMU error codes here.
@@ -348,6 +387,7 @@ static void __smu_msg_v1_send(struct smu_msg_ctl *ctl, u16 index,
 		arg = i < args->num_args ? args->args[i] : 0;
 		WREG32(cfg->arg_regs[i], arg);
 	}
+	ctl->last_msg = args->msg;
 	WREG32(cfg->msg_reg, index);
 }
 
@@ -441,6 +481,39 @@ static void __smu_msg_v1_print_error(struct smu_msg_ctl *ctl,
 	}
 }
 
+/* Called with ctl->lock held, including the split asynchronous wait path. */
+static void __smu_msg_v1_etime_track(struct smu_msg_ctl *ctl, int ret)
+{
+	struct smu_context *smu = ctl->smu;
+	struct amdgpu_device *adev = smu->adev;
+
+	if (ret != -ETIME || !smu_etime_streak) {
+		ctl->timeout_streak = 0;
+		return;
+	}
+
+	if (++ctl->timeout_streak < smu_etime_streak)
+		return;
+
+	smu->smc_fw_state = SMU_FW_HANG;
+	dev_err(smu->adev->dev,
+		"SMU: %u consecutive response timeouts; last message %s, msg_reg: 0x%x; marking firmware as hanged\n",
+		ctl->timeout_streak, smu_get_message_name(smu, ctl->last_msg),
+		RREG32(ctl->config.msg_reg));
+}
+
+/* Reset ACK messages are the SMU-based recovery path. Fail-fast on a hung
+ * firmware must not reject them, or the driver loses the very mechanism it
+ * uses to recover a slow-but-responsive PMFW.
+ */
+static bool smu_msg_is_reset_ack(u32 msg)
+{
+	return msg == SMU_MSG_DriverMode2Reset ||
+	       msg == SMU_MSG_GfxDeviceDriverReset ||
+	       msg == SMU_MSG_GfxDriverResetRecovery ||
+	       msg == SMU_MSG_Mode2Reset;
+}
+
 static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 				   enum smu_message_type msg, u32 msg_flags,
 				   bool *skip_pre_poll)
@@ -455,8 +528,12 @@ static int __smu_msg_v1_ras_filter(struct smu_msg_ctl *ctl,
 
 	fed_status = amdgpu_ras_get_fed_status(adev);
 
-	/* Block non-RAS-priority messages during RAS error */
-	if (fed_status && !(msg_flags & SMU_MSG_RAS_PRI)) {
+	/* Block non-RAS-priority messages during RAS error. Reset ACKs must get
+	 * through: they are the recovery path from a wedged firmware and some
+	 * reset enums are not mapped RAS_PRI.
+	 */
+	if (fed_status && !(msg_flags & SMU_MSG_RAS_PRI) &&
+	    !smu_msg_is_reset_ack(msg)) {
 		dev_dbg(adev->dev, "RAS error detected, skip sending %s",
 			smu_get_message_name(smu, msg));
 		return -EACCES;
@@ -488,7 +565,7 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	struct smu_context *smu = ctl->smu;
 	struct amdgpu_device *adev = smu->adev;
 	const struct cmn2asic_msg_mapping *mapping;
-	u32 reg, msg_flags;
+	u32 reg = SMU_RESP_NONE, msg_flags;
 	int ret, index;
 	bool skip_pre_poll = false;
 	bool lock_held = args->flags & SMU_MSG_FLAG_LOCK_HELD;
@@ -525,46 +602,100 @@ static int smu_msg_v1_send_msg(struct smu_msg_ctl *ctl,
 	if (ret)
 		goto out;
 
-	/* FW state checks */
-	if (smu->smc_fw_state == SMU_FW_HANG) {
+	/* FW state checks. Reset ACK messages bypass the hang gate so a
+	 * firmware marked hung by a timeout streak can still be reset.
+	 */
+	if (smu->smc_fw_state == SMU_FW_HANG && !smu_msg_is_reset_ack(args->msg)) {
 		dev_err(adev->dev,
 			"SMU is in hanged state, failed to send smu message!\n");
 		ret = -EREMOTEIO;
+		smu_lte_trace(ctl, "blocked", args->msg, 0, 0, ret, args->timeout);
 		goto out;
 	} else if (smu->smc_fw_state == SMU_FW_INIT) {
 		skip_pre_poll = true;
 		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
+		ctl->last_msg = SMU_MSG_MAX_COUNT;
 	}
+
+	/* A hung firmware leaves the response register at SMU_RESP_NONE. The
+	 * normal pre-poll would treat that as a fatal stall and never write the
+	 * reset command, defeating the hang-gate bypass above. Reset/ACK
+	 * messages must be sent unconditionally, matching NO_PRECHECK mappings.
+	 */
+	if (smu_msg_is_reset_ack(args->msg))
+		skip_pre_poll = true;
 
 	/* Pre-poll: ensure previous message completed */
 	if (!skip_pre_poll) {
+		smu_lte_trace(ctl, "pre-begin", ctl->last_msg, 0, 0, 0, args->timeout);
 		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
 		ret = smu_msg_v1_decode_response(reg);
+		__smu_msg_v1_etime_track(ctl, ret);
+		smu_lte_trace(ctl, "pre-end", ctl->last_msg, 0, reg, ret, args->timeout);
 		if (reg == SMU_RESP_NONE || ret == -EREMOTEIO) {
 			__smu_msg_v1_print_error(ctl, reg, args);
 			goto out;
 		}
 	}
 
-	/* Send message */
-	__smu_msg_v1_send(ctl, (u16)index, args);
+	/*
+	 * Send message and poll for the response. SMU_RESP_BUSY_OTHER means
+	 * the PMFW is executing another command; its documented client
+	 * behavior is to retry in 10 us, which we do up to
+	 * SMU_MSG_V1_BUSY_RETRIES times before giving up, so a power/clock
+	 * write is not lost while the PMFW makes a transition.
+	 */
+	for (u32 retries = 0;; retries++) {
+		smu_lte_trace(ctl, "send", args->msg,
+			      args->num_args > 0 ? args->args[0] : 0,
+			      0, 0, args->timeout);
+		__smu_msg_v1_send(ctl, (u16)index, args);
 
-	/* Post-poll (skip if ASYNC) */
-	if (args->flags & SMU_MSG_FLAG_ASYNC) {
-		ret = 0;
-		goto out;
+		/* Post-poll (skip if ASYNC) */
+		if (args->flags & SMU_MSG_FLAG_ASYNC) {
+			ret = 0;
+			goto out;
+		}
+
+		reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
+		ret = smu_msg_v1_decode_response(reg);
+		smu_lte_trace(ctl, "post-end", args->msg,
+			      args->num_args > 0 ? args->args[0] : 0,
+			      reg, ret, args->timeout);
+
+		if (ret == -EBUSY && retries < SMU_MSG_V1_BUSY_RETRIES) {
+			udelay(10);
+			continue;
+		}
+		break;
 	}
-
-	reg = __smu_msg_v1_poll_stat(ctl, args->timeout);
-	ret = smu_msg_v1_decode_response(reg);
 
 	/* FW state update on fatal error */
 	if (ret == -EREMOTEIO) {
 		smu->smc_fw_state = SMU_FW_HANG;
 		__smu_msg_v1_print_error(ctl, reg, args);
+	} else if (ret == 0 && smu_msg_is_reset_ack(args->msg) &&
+		 smu->smc_fw_state == SMU_FW_HANG) {
+		/* Some reset ACKs are sent only synchronously (e.g.
+		 * GfxDriverResetRecovery / Mode2Reset), so the clearing in
+		 * wait_response never runs for them. Clear here too, otherwise
+		 * a successful reset still leaves ordinary messages blocked.
+		 */
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
 	} else if (ret != 0) {
 		__smu_msg_v1_print_error(ctl, reg, args);
 	}
+	/* Reset ACKs skipped the pre-poll, so only their own post-poll observes
+	 * the response. Mirror the wait-path carve-out: a slow reset must not
+	 * itself drive the streak to HANG with no reachable clear. A genuinely
+	 * wedged firmware is still caught by the next ordinary message's
+	 * pre-poll.
+	 */
+	if (!(args->flags & SMU_MSG_FLAG_ASYNC) &&
+	    (ret != -ETIME || !smu_msg_is_reset_ack(args->msg)))
+		__smu_msg_v1_etime_track(ctl, ret);
 
 	/* Read output args */
 	if ((ret == 0 || (args->flags & SMU_MSG_FLAG_FORCE_READ_ARG)) &&
@@ -610,11 +741,36 @@ static int smu_msg_v1_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us)
 	u32 reg;
 	int ret;
 
+	/* The reset ACK loop must observe its own completion even after the
+	 * streak policy marked the firmware hung.
+	 */
+	if (smu->smc_fw_state == SMU_FW_HANG &&
+	    !smu_msg_is_reset_ack(ctl->last_msg))
+		return -EREMOTEIO;
+
+	smu_lte_trace(ctl, "wait-begin", ctl->last_msg, 0, 0, 0, timeout_us);
 	reg = __smu_msg_v1_poll_stat(ctl, timeout_us);
 	ret = smu_msg_v1_decode_response(reg);
 
 	if (ret == -EREMOTEIO)
 		smu->smc_fw_state = SMU_FW_HANG;
+	/* A completed reset ACK proves the firmware is responsive again; clear
+	 * the fail-fast state so ordinary messages are no longer blocked.
+	 */
+	else if (ret == 0 && smu_msg_is_reset_ack(ctl->last_msg) &&
+		 smu->smc_fw_state == SMU_FW_HANG) {
+		smu->smc_fw_state = SMU_FW_RUNTIME;
+		ctl->timeout_streak = 0;
+	}
+	/*
+	 * Reset callers own a longer, bounded ACK wait. Timing out one poll
+	 * must not prevent a later poll from observing reset completion.
+	 * A subsequent send still applies the normal pre-poll policy.
+	 */
+	else if (ret != -ETIME || !smu_msg_is_reset_ack(ctl->last_msg))
+		__smu_msg_v1_etime_track(ctl, ret);
+
+	smu_lte_trace(ctl, "wait-end", ctl->last_msg, 0, reg, ret, timeout_us);
 
 	if (unlikely(adev->pm.smu_debug_mask & SMU_DEBUG_HALT_ON_ERROR) &&
 	    ret && (ret != -ETIME)) {

@@ -183,6 +183,17 @@ struct device_queue_manager_ops {
 	int (*restore_process_queues)(struct device_queue_manager *dqm,
 				      struct qcm_process_device *qpd);
 
+	/* Outcomes describe actual counter changes, independently of errno. */
+	int (*evict_process_queues_ref)(struct device_queue_manager *dqm,
+					struct qcm_process_device *qpd,
+					enum kfd_eviction_owner owner,
+					bool *acquired,
+					bool retry);
+	int (*restore_process_queues_ref)(struct device_queue_manager *dqm,
+					  struct qcm_process_device *qpd,
+					  enum kfd_eviction_owner owner,
+					  bool *consumed);
+
 	int	(*get_wave_state)(struct device_queue_manager *dqm,
 				  struct queue *q,
 				  void __user *ctl_stack,
@@ -265,6 +276,7 @@ struct device_queue_manager {
 	uint64_t		pipelines_addr;
 	uint64_t		fence_gpu_addr;
 	uint64_t		*fence_addr;
+	u64			sandbox_fence_seq;
 	struct kfd_mem_obj	*fence_mem;
 	bool			active_runlist;
 	int			sched_policy;
@@ -288,9 +300,6 @@ struct device_queue_manager {
 	struct dqm_detect_hang_info *detect_hang_info;
 	size_t detect_hang_info_size;
 	int detect_hang_count;
-	/* for per-queue reset with mes */
-	u32 *hung_db_array;
-	struct amdgpu_mes_hung_queue_hqd_info *hqd_info;
 };
 
 void device_queue_manager_init_cik(
@@ -366,6 +375,13 @@ static inline void dqm_lock(struct device_queue_manager *dqm)
 {
 	mutex_lock(&dqm->lock_hidden);
 	dqm->saved_flags = memalloc_noreclaim_save();
+}
+static inline bool dqm_trylock(struct device_queue_manager *dqm)
+{
+	if (!mutex_trylock(&dqm->lock_hidden))
+		return false;
+	dqm->saved_flags = memalloc_noreclaim_save();
+	return true;
 }
 static inline void dqm_unlock(struct device_queue_manager *dqm)
 {

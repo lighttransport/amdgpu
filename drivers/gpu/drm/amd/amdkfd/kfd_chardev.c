@@ -40,6 +40,7 @@
 #include <linux/dma-buf.h>
 #include <linux/processor.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_svm.h"
 #include "kfd_ipc.h"
@@ -218,6 +219,14 @@ static int kfd_open(struct inode *inode, struct file *filep)
 	if (IS_ERR(process))
 		return PTR_ERR(process);
 
+	{
+		int ret = amdgpu_sb_check_current(process->sandbox, NULL);
+
+		if (ret) {
+			kfd_unref_process(process);
+			return ret;
+		}
+	}
 	/* filep now owns the reference returned by kfd_create_process */
 	filep->private_data = process;
 
@@ -324,7 +333,7 @@ static int set_queue_properties_from_user(struct queue_properties *q_properties,
 	q_properties->queue_percent = args->queue_percentage & 0xFF;
 	/* bit 8-15 are repurposed to be PM4 target XCC */
 	q_properties->pm4_target_xcc = (args->queue_percentage >> 8) & 0xFF;
-	q_properties->priority = args->queue_priority;
+	q_properties->priority = kfd_cap_queue_priority(args->queue_priority);
 	q_properties->queue_address = args->ring_base_address;
 	q_properties->queue_size = args->ring_size;
 	if (args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE_AQL)
@@ -483,8 +492,11 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 	return 0;
 
 err_create_queue:
-	kfd_queue_unref_bo_vas(pdd, &q_properties);
-	kfd_queue_release_buffers(pdd, &q_properties);
+	/* PQM owns the original references when MES removal is unconfirmed. */
+	if (!q_properties.is_create_failed) {
+		kfd_queue_unref_bo_vas(pdd, &q_properties);
+		kfd_queue_release_buffers(pdd, &q_properties);
+	}
 err_acquire_queue_buf:
 err_sdma_engine_id:
 err_bind_process:
@@ -555,7 +567,7 @@ static int kfd_ioctl_update_queue(struct file *filp, struct kfd_process *p,
 	properties.queue_percent = args->queue_percentage & 0xFF;
 	/* bit 8-15 are repurposed to be PM4 target XCC */
 	properties.pm4_target_xcc = (args->queue_percentage >> 8) & 0xFF;
-	properties.priority = args->queue_priority;
+	properties.priority = kfd_cap_queue_priority(args->queue_priority);
 
 	pr_debug("Updating queue id %d for process pid %d\n",
 			args->queue_id, p->lead_thread->pid);
@@ -1151,6 +1163,12 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	if (args->size == 0)
 		return -EINVAL;
 
+	/* Reject wrapping intervals before SVM lookup or deferred-work flushing. */
+	if (args->va_addr > U64_MAX - (args->size - 1) ||
+	    ((flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR) &&
+	     args->mmap_offset > U64_MAX - (args->size - 1)))
+		return -EINVAL;
+
 	if (p->context_id != KFD_CONTEXT_ID_PRIMARY && (flags & KFD_IOC_ALLOC_MEM_FLAGS_USERPTR)) {
 		pr_debug("USERPTR is not supported on non-primary kfd_process\n");
 
@@ -1172,8 +1190,8 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	    interval_tree_iter_first(&p->svms.objects,
 				     args->va_addr >> PAGE_SHIFT,
 				     (args->va_addr + args->size - 1) >> PAGE_SHIFT)) {
-		pr_err("Address: 0x%llx already allocated by SVM\n",
-			args->va_addr);
+		pr_err_ratelimited("SVM VA overlap: tgid=%d context=%u address=0x%llx size=0x%llx\n",
+			current->tgid, p->context_id, args->va_addr, args->size);
 		mutex_unlock(&p->svms.lock);
 		return -EADDRINUSE;
 	}
@@ -1185,8 +1203,9 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	    interval_tree_iter_first(&p->svms.objects,
 				     args->mmap_offset >> PAGE_SHIFT,
 				     (args->mmap_offset  + args->size - 1) >> PAGE_SHIFT)) {
-		pr_err("User Buffer Address: 0x%llx already allocated by SVM\n",
-			args->mmap_offset);
+		pr_err_ratelimited("SVM USERPTR overlap: tgid=%d context=%u address=0x%llx size=0x%llx\n",
+			current->tgid, p->context_id, args->mmap_offset,
+			args->size);
 		mutex_unlock(&p->svms.lock);
 		return -EADDRINUSE;
 	}
@@ -1285,7 +1304,7 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	idr_handle = kfd_process_device_create_obj_handle(pdd, mem,
 			args->va_addr, args->size, cpuva, mem_type, -1);
 	if (idr_handle < 0) {
-		err = -EFAULT;
+		err = idr_handle;
 		goto err_free;
 	}
 
@@ -3090,7 +3109,8 @@ static int criu_unpause(struct file *filep,
 		return -EINVAL;
 	}
 
-	ret = kfd_process_restore_queues(p);
+	ret = kfd_process_restore_queues(p,
+					 KFD_QUEUE_EVICTION_CRIU_RESTORE);
 	if (ret)
 		pr_err("Failed to unpause queues ret:%d\n", ret);
 	else
@@ -3180,7 +3200,8 @@ static int criu_process_info(struct file *filep,
 
 err_unlock:
 	if (ret) {
-		kfd_process_restore_queues(p);
+		kfd_process_restore_queues(p,
+					   KFD_QUEUE_EVICTION_CRIU_CHECKPOINT);
 		p->queues_paused = false;
 	}
 	mutex_unlock(&p->mutex);
@@ -4073,6 +4094,14 @@ static long kfd_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	 * processes need to create their own KFD device context.
 	 */
 	process = filep->private_data;
+	if (!process) {
+		retcode = -ESRCH;
+		goto err_i1;
+	}
+	retcode = amdgpu_sb_check_current(process->sandbox, NULL);
+	if (retcode)
+		goto err_i1;
+
 
 	rcu_read_lock();
 	if ((ioctl->flags & KFD_IOC_FLAG_CHECKPOINT_RESTORE) &&
@@ -4231,6 +4260,7 @@ static int kfd_mmap(struct file *filep, struct vm_area_struct *vma)
 	struct kfd_node *dev = NULL;
 	unsigned long mmap_offset;
 	unsigned int gpu_id;
+	int ret;
 
 	process = filep->private_data;
 	if (!process)
@@ -4238,6 +4268,10 @@ static int kfd_mmap(struct file *filep, struct vm_area_struct *vma)
 
 	if (process->lead_thread != current->group_leader)
 		return -EBADF;
+
+	ret = amdgpu_sb_check_current(process->sandbox, NULL);
+	if (ret)
+		return ret;
 
 	mmap_offset = vma->vm_pgoff << PAGE_SHIFT;
 	gpu_id = KFD_MMAP_GET_GPU_ID(mmap_offset);

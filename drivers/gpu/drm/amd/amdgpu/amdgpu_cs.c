@@ -37,6 +37,7 @@
 
 #include "amdgpu_cs.h"
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_gmc.h"
 #include "amdgpu_gem.h"
@@ -307,6 +308,10 @@ static int amdgpu_cs_pass1(struct amdgpu_cs_parser *p,
 #endif
 		if (ret)
 			goto free_all_kdata;
+		ret = amdgpu_sb_charge(fpriv->sandbox, AMDGPU_SB_JOBS, 1);
+		if (ret)
+			goto free_all_kdata;
+		p->jobs[i]->sandbox = amdgpu_sb_get(fpriv->sandbox);
 		switch (p->adev->enforce_isolation[fpriv->xcp_id]) {
 		case AMDGPU_ENFORCE_ISOLATION_DISABLE:
 		default:
@@ -330,6 +335,17 @@ static int amdgpu_cs_pass1(struct amdgpu_cs_parser *p,
 	p->gang_leader = p->jobs[p->gang_leader_idx];
 
 	if (p->ctx->generation != p->gang_leader->generation) {
+		struct amdgpu_fpriv *fpriv = p->filp->driver_priv;
+
+		/* Identify which reset invalidated the context (VRAM loss vs VM). */
+		dev_warn_ratelimited(p->adev->dev,
+			"CS cancelled for %s[%d]: ctx gen 0x%llx job gen 0x%llx vram_lost %d vm_delayed_err %d reset %d\n",
+			current->comm, task_pid_nr(current),
+			(unsigned long long)p->ctx->generation,
+			(unsigned long long)p->gang_leader->generation,
+			atomic_read(&p->adev->vram_lost_counter),
+			drm_sched_entity_error(&fpriv->vm.delayed),
+			atomic_read(&p->adev->gpu_reset_counter));
 		ret = -ECANCELED;
 		goto free_all_kdata;
 	}

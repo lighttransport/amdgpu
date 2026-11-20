@@ -27,6 +27,7 @@
 #include "kfd_device_queue_manager.h"
 #include "kfd_kernel_queue.h"
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 
 #define OVER_SUBSCRIPTION_PROCESS_COUNT (1 << 0)
 #define OVER_SUBSCRIPTION_COMPUTE_QUEUE_COUNT (1 << 1)
@@ -182,6 +183,9 @@ build_runlist_ib:
 	/* build the run list ib packet */
 	list_for_each_entry(cur, queues, list) {
 		qpd = cur->qpd;
+		/* Never rebuild quarantined processes into a hardware runlist. */
+		if (amdgpu_sb_check(qpd->pqm->process->sandbox))
+			continue;
 		/* group processes with the same xnack mode together */
 		if (qpd->pqm->process->xnack_enabled != xnack_enabled)
 			continue;

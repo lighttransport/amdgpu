@@ -238,7 +238,7 @@ static struct kfd_mem_obj *allocate_mqd(struct mqd_manager *mm,
 		mqd_mem_obj = kzalloc_obj(struct kfd_mem_obj);
 		if (!mqd_mem_obj)
 			return NULL;
-		retval = amdgpu_amdkfd_alloc_kernel_mem(node->adev,
+		retval = amdgpu_amdkfd_alloc_kernel_mem_owned(node->adev,
 			(ALIGN(ALIGN(q->ctl_stack_size, AMDGPU_GPU_PAGE_SIZE) +
 			ALIGN(sizeof(struct v9_mqd), AMDGPU_GPU_PAGE_SIZE), PAGE_SIZE)) *
 			NUM_XCC(node->xcc_mask),
@@ -246,7 +246,7 @@ static struct kfd_mem_obj *allocate_mqd(struct mqd_manager *mm,
 						  AMDGPU_GEM_DOMAIN_GTT,
 			&(mqd_mem_obj->mem),
 			&(mqd_mem_obj->gpu_addr),
-			(void *)&(mqd_mem_obj->cpu_ptr), true, true);
+			(void *)&(mqd_mem_obj->cpu_ptr), true, true, q->sandbox);
 
 		if (retval) {
 			kfree(mqd_mem_obj);

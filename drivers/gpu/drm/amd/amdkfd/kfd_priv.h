@@ -41,6 +41,7 @@
 #include <linux/sysfs.h>
 #include <linux/interval_tree.h>
 #include <linux/semaphore.h>
+#include <linux/wait.h>
 /* amdkcl: this header file is included in kcl_device_cgroup.h
 #include <linux/device_cgroup.h>*/
 #include <drm/drm_file.h>
@@ -193,6 +194,21 @@ extern int sched_policy;
  * number per HW scheduler
  */
 extern int hws_max_conc_proc;
+
+/* CUs left free of default-masked KFD compute queues (amdgpu.kfd_gfx_reserved_cus). */
+extern int kfd_gfx_reserved_cus;
+
+/* Optional cap on KFD user queue priority (amdgpu.kfd_queue_priority_cap). */
+extern int kfd_queue_priority_cap;
+
+static inline uint32_t kfd_cap_queue_priority(uint32_t priority)
+{
+	int cap = READ_ONCE(kfd_queue_priority_cap);
+
+	if (cap >= 0 && cap <= KFD_MAX_QUEUE_PRIORITY && priority > (uint32_t)cap)
+		return cap;
+	return priority;
+}
 
 extern int cwsr_enable;
 
@@ -417,6 +433,10 @@ struct kfd_dev {
 
 	bool init_complete;
 
+	/* Global suspend/reset references, protected by kfd_processes_mutex. */
+	unsigned int suspend_count;
+	bool reset_locked;
+
 	/* Firmware versions */
 	uint16_t mec_fw_version;
 	uint16_t mec2_fw_version;
@@ -458,6 +478,7 @@ struct kfd_dev {
 	int kfd_dev_lock;
 
 	atomic_t kfd_processes_count;
+	wait_queue_head_t process_exit_wait;
 
 	/* Lock for profiler process */
 	struct mutex profiler_lock;
@@ -595,7 +616,11 @@ enum KFD_QUEUE_PRIORITY {
  *
  */
 
+struct amdgpu_sandbox;
+
 struct queue_properties {
+	/* Borrowed from the process/queue for private MQD allocations. */
+	struct amdgpu_sandbox *sandbox;
 	enum kfd_queue_type type;
 	enum kfd_queue_format format;
 	unsigned int queue_id;
@@ -612,6 +637,8 @@ struct queue_properties {
 	bool is_evicted;
 	bool is_suspended;
 	bool is_being_destroyed;
+	/* Failed MES create retained by PQM; also signals caller ownership transfer. */
+	bool is_create_failed;
 	bool is_active;
 	bool is_gws;
 	uint32_t pm4_target_xcc;
@@ -664,8 +691,9 @@ struct queue_properties {
 #define QUEUE_IS_ACTIVE(q) ((q).queue_size > 0 &&	\
 			    (q).queue_address != 0 &&	\
 			    (q).queue_percent > 0 &&	\
-			    !(q).is_evicted &&		\
-			    !(q).is_suspended)
+			    !(q).is_evicted &&	\
+			    !(q).is_suspended &&	\
+			    !(q).is_create_failed)
 
 enum mqd_update_flag {
 	UPDATE_FLAG_DBG_WA_ENABLE = 1,
@@ -718,12 +746,23 @@ struct mqd_update_info {
  *
  */
 
+struct amdgpu_sandbox;
+struct amdgpu_sb_client;
+
 struct queue {
+	struct amdgpu_sandbox *sandbox;
+	u64 sandbox_context;
 	struct list_head list;
 	void *mqd;
 	struct kfd_mem_obj *mqd_mem_obj;
 	uint64_t gart_mqd_addr;
 	struct queue_properties properties;
+	/* DQM-serialized: no MES submission since the last acknowledged removal. */
+	bool mes_queue_removed;
+	/* DQM-serialized: MES firmware generation of the last ADD_QUEUE. */
+	u32 mes_fw_gen;
+	/* DQM-serialized: a failed no-CP eviction still needs a confirmed drain. */
+	bool eviction_drain_pending;
 
 	uint32_t mec;
 	uint32_t pipe;
@@ -787,6 +826,19 @@ struct process_queue_manager {
 	unsigned long		*queue_slot_bitmap;
 };
 
+/* Each per-device eviction reference belongs to one independent caller. */
+enum kfd_eviction_owner {
+	KFD_EVICTION_OWNER_SVM,
+	KFD_EVICTION_OWNER_USERPTR,
+	KFD_EVICTION_OWNER_TTM,
+	KFD_EVICTION_OWNER_SUSPEND,
+	KFD_EVICTION_OWNER_CRIU_CHECKPOINT,
+	KFD_EVICTION_OWNER_CRIU_RESTORE,
+	KFD_EVICTION_OWNER_QUARANTINE,
+	KFD_EVICTION_OWNER_FAULT,
+	KFD_EVICTION_OWNER_COUNT,
+};
+
 struct qcm_process_device {
 	/* The Device Queue Manager that owns this data */
 	struct device_queue_manager *dqm;
@@ -799,6 +851,12 @@ struct qcm_process_device {
 	unsigned int vmid;
 	bool is_debug;
 	unsigned int evicted; /* eviction counter, 0=active */
+	/* Per-device owner counts, protected by the DQM lock. */
+	unsigned int eviction_refs[KFD_EVICTION_OWNER_COUNT];
+	/* A failed runlist drain must be retried before restore or MQD release. */
+	bool eviction_drain_pending;
+	/* Subset reserved for TTM; protected by the DQM lock. */
+	unsigned int ttm_reserved;
 
 	/* This flag tells if we should reset all wavefronts on
 	 * process termination
@@ -918,6 +976,8 @@ struct kfd_process_device {
 
 	/* per-process-per device QCM data structure */
 	struct qcm_process_device qpd;
+	/* TTM-owned DQM references, protected by process->ttm_restore_lock. */
+	unsigned int ttm_evicted;
 
 	/*Apertures*/
 	uint64_t lds_base;
@@ -1167,6 +1227,8 @@ struct kfd_dlog_session {
 
 /* Process data */
 struct kfd_process {
+	struct amdgpu_sandbox *sandbox;
+	struct amdgpu_sb_client *sandbox_client;
 	/*
 	 * kfd_process are stored in an mm_struct*->kfd_process*
 	 * hash table (kfd_processes in kfd_process.c)
@@ -1257,6 +1319,9 @@ struct kfd_process {
 	struct dma_fence __rcu *ef;
 
 	/* Work items for evicting and restoring BOs */
+	struct mutex ttm_restore_lock;
+	bool ttm_bos_pending;
+	u64 ttm_restore_epoch;
 	struct delayed_work eviction_work;
 	struct delayed_work restore_work;
 	/* seqno of the last scheduled eviction */
@@ -1387,7 +1452,7 @@ static inline struct kfd_process_device *kfd_process_device_from_gpuidx(
 
 void kfd_unref_process(struct kfd_process *p);
 int kfd_process_evict_queues(struct kfd_process *p, bool force, uint32_t trigger);
-int kfd_process_restore_queues(struct kfd_process *p);
+int kfd_process_restore_queues(struct kfd_process *p, uint32_t trigger);
 void kfd_suspend_all_processes(bool force);
 int kfd_resume_all_processes(void);
 
@@ -1691,6 +1756,7 @@ struct kernel_queue *kernel_queue_init(struct kfd_node *dev,
 					enum kfd_queue_type type);
 void kernel_queue_uninit(struct kernel_queue *kq);
 int kfd_evict_process_device(struct kfd_process_device *pdd);
+int kfd_sandbox_evict_process_device(struct kfd_process_device *pdd);
 int kfd_dqm_suspend_bad_queue_mes(struct kfd_node *knode, u32 pasid, u32 doorbell_id);
 
 /* Process Queue Manager */
@@ -2000,6 +2066,10 @@ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data);
 int pqm_debugfs_mqds(struct seq_file *m, void *data);
 int kfd_debugfs_hqds_by_device(struct seq_file *m, void *data);
 int dqm_debugfs_hqds(struct seq_file *m, void *data);
+int dqm_debugfs_qstate(struct seq_file *m, struct kfd_process_device *pdd,
+		       bool repair);
+int kfd_debugfs_qstate_by_process(struct seq_file *m, void *data);
+int kfd_debugfs_qstate_repair(pid_t pid);
 int kfd_debugfs_rls_by_device(struct seq_file *m, void *data);
 int pm_debugfs_runlist(struct seq_file *m, void *data);
 

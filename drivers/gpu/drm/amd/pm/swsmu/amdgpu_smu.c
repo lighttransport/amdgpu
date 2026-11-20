@@ -23,11 +23,13 @@
 #define SWSMU_CODE_LAYER_L1
 
 #include <linux/firmware.h>
+#include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 
 #include "amdgpu.h"
+#include "amdgpu_lte_debug.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_smu.h"
 #include "smu_internal.h"
@@ -60,6 +62,27 @@
 #undef pr_warn
 #undef pr_info
 #undef pr_debug
+
+/* Experimental Navi 48 PPT floor override; stock policy unless opted in. */
+static unsigned int amdgpu_smu_min_power_cap;
+module_param_named(min_power_cap, amdgpu_smu_min_power_cap, uint, 0444);
+MODULE_PARM_DESC(min_power_cap,
+		 "Navi 48 minimum PPT cap in watts (0 = SKU minimum; experimental, may hang GPU)");
+
+static u32 smu_min_ppt_limit(struct smu_context *smu, u32 limit_type,
+			     u32 min_limit)
+{
+	struct amdgpu_device *adev = smu->adev;
+
+	if (!amdgpu_smu_min_power_cap || smu->is_apu || amdgpu_sriov_vf(adev) ||
+	    limit_type != SMU_DEFAULT_PPT_LIMIT ||
+	    amdgpu_ip_version(adev, GC_HWIP, 0) != IP_VERSION(12, 0, 1) ||
+	    (amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 2) &&
+	     amdgpu_ip_version(adev, MP1_HWIP, 0) != IP_VERSION(14, 0, 3)))
+		return min_limit;
+
+	return min_t(u32, amdgpu_smu_min_power_cap, min_limit);
+}
 
 static const struct amd_pm_funcs swsmu_pm_funcs;
 static int smu_force_smuclk_levels(struct smu_context *smu,
@@ -604,6 +627,17 @@ static void smu_restore_dpm_user_profile(struct smu_context *smu)
 		}
 	}
 
+	/*
+	 * The PMFW comes back from suspend without soft clock limits, and the
+	 * performance level is only reapplied when it changes, so re-apply a
+	 * user GFX clock cap explicitly, after any OD table upload above.
+	 */
+	if (smu->user_dpm_profile.gfx_clk_max) {
+		ret = smu_asic_set_performance_level(smu, smu_dpm_ctx->dpm_level);
+		if (ret)
+			dev_err(smu->adev->dev, "Failed to restore GFX clock cap\n");
+	}
+
 	/* Disable restore flag */
 	smu->user_dpm_profile.flags &= ~SMU_DPM_USER_PROFILE_RESTORE;
 }
@@ -1014,6 +1048,18 @@ static int smu_late_init(struct amdgpu_ip_block *ip_block)
 	if (adev->in_suspend || amdgpu_reset_in_recovery(adev))
 		smu_restore_ppt_limits(smu, false);
 	smu_restore_dpm_user_profile(smu);
+
+	/*
+	 * A GPU reset also drops PMFW soft limits, but the user profile is
+	 * restored only on resume and the level is reapplied only when it
+	 * changes, so reapply a user GFX clock cap here.
+	 */
+	if (amdgpu_reset_in_recovery(adev) && !adev->in_suspend &&
+	    smu->user_dpm_profile.gfx_clk_max) {
+		ret = smu_asic_set_performance_level(smu, smu->smu_dpm.dpm_level);
+		if (ret)
+			dev_err(adev->dev, "Failed to restore GFX clock cap after reset\n");
+	}
 
 	return 0;
 }
@@ -2137,6 +2183,10 @@ static int smu_disable_dpms(struct smu_context *smu)
 		}
 	}
 
+	/* Do not halt RLC while the SMU may still be managing its features. */
+	if (ret)
+		return ret;
+
 	/* Notify SMU RLC is going to be off, stop RLC and SMU interaction.
 	 * otherwise SMU will hang while interacting with RLC if RLC is halted
 	 * this is a WA for Vangogh asic which fix the SMU hang issue.
@@ -3025,6 +3075,7 @@ int smu_get_ppt_limit(void *handle,
 		*limit = smu->od_enabled ?
 			smu->ppt_limits.range[power_source][limit_type].od_min :
 			smu->ppt_limits.range[power_source][limit_type].min;
+		*limit = smu_min_ppt_limit(smu, limit_type, *limit);
 		break;
 	default:
 		return -EINVAL;
@@ -3050,6 +3101,7 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 		SMU_POWER_SOURCE_AC : SMU_POWER_SOURCE_DC;
 	range = &smu->ppt_limits.range[power_source][limit_type];
 	min_limit = smu->od_enabled ? range->od_min : range->min;
+	min_limit = smu_min_ppt_limit(smu, limit_type, min_limit);
 	max_limit = smu->od_enabled ? range->od_max : range->max;
 
 	if (!(smu->ppt_limits.supported_mask & BIT(limit_type)))
@@ -3061,7 +3113,12 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 			return ret;
 	}
 
+	amdgpu_lte_ppt_trace(smu->adev, "request", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, 0);
+
 	if (limit > max_limit || limit < min_limit) {
+		amdgpu_lte_ppt_trace(smu->adev, "range-error", limit_type, limit,
+				     min_limit, max_limit, U32_MAX, -EINVAL);
 		dev_err(smu->adev->dev,
 			"New PPT limit (%d) is out of range [%d,%d]\n",
 			limit, min_limit, max_limit);
@@ -3071,9 +3128,61 @@ static int smu_set_ppt_limit(void *handle, uint32_t limit_type, uint32_t limit)
 	if (!smu->ppt_funcs->set_ppt_limit)
 		return -EOPNOTSUPP;
 
+	amdgpu_lte_ppt_trace(smu->adev, "set-begin", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, 0);
 	ret = smu->ppt_funcs->set_ppt_limit(smu, limit_type, limit);
+	amdgpu_lte_ppt_trace(smu->adev, "set-end", limit_type, limit,
+			     min_limit, max_limit, U32_MAX, ret);
 	if (ret)
 		return ret;
+
+	/*
+	 * LTE hardening: verify that the PMFW holds the limit we just set.
+	 * The firmware has been observed to accept a SetPowerLimit message
+	 * outside its validated range without failing it and to misbehave
+	 * afterwards, so detect silent acceptance: read the limit back and
+	 * fail the write if it is not what was requested (small relative
+	 * slack allowed for firmware rounding).
+	 */
+	if (smu->ppt_funcs->get_ppt_limit) {
+		u32 held = U32_MAX;
+
+		amdgpu_lte_ppt_trace(smu->adev, "readback-begin", limit_type, limit,
+				     min_limit, max_limit, U32_MAX, 0);
+		ret = smu_get_asic_ppt_limit(smu, limit_type, &held);
+		amdgpu_lte_ppt_trace(smu->adev, "readback-end", limit_type, limit,
+				     min_limit, max_limit, ret ? U32_MAX : held, ret);
+		if (ret) {
+			/* Asics that cannot read a limit back (e.g. a PPT1
+			 * implementation returning -EOPNOTSUPP) keep the old
+			 * behavior; only refuse a write we can verify.
+			 */
+			if (ret != -EOPNOTSUPP && ret != -ENOTSUPP) {
+				dev_err(smu->adev->dev,
+					"PPT limit read-back failed (%d) after setting limit %u\n",
+					ret, limit);
+				return -EIO;
+			}
+		} else if ((held > limit ? held - limit : limit - held) > limit / 25 + 1) {
+			amdgpu_lte_ppt_trace(smu->adev, "mismatch", limit_type, limit,
+					     min_limit, max_limit, held, -EIO);
+			dev_err(smu->adev->dev,
+				"PPT limit read-back mismatch: set %u, firmware holds %u; refusing the write\n",
+				limit, held);
+			/* The firmware did apply a value even though it differs from
+			 * the request. Record that actual value (when plausible)
+			 * so a later resume restores what the hardware holds, not
+			 * the stale value the write was intended to replace.
+			 */
+			if (held != U32_MAX && held >= min_limit && held <= max_limit &&
+			    !(smu->user_dpm_profile.flags & SMU_DPM_USER_PROFILE_RESTORE)) {
+				smu->user_dpm_profile.ppt_limits[power_source][limit_type] = held;
+				smu->user_dpm_profile.ppt_limit_user_mask[power_source] |=
+					BIT(limit_type);
+			}
+			return -EIO;
+		}
+	}
 	if (!(smu->user_dpm_profile.flags & SMU_DPM_USER_PROFILE_RESTORE)) {
 		smu->user_dpm_profile.ppt_limits[power_source][limit_type] = limit;
 		smu->user_dpm_profile.ppt_limit_user_mask[power_source] |=

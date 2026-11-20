@@ -25,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/overflow.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_topology.h"
 #include "kfd_svm.h"
 
@@ -76,6 +77,8 @@ int init_queue(struct queue **q, const struct queue_properties *properties)
 		return -ENOMEM;
 
 	memcpy(&tmp_q->properties, properties, sizeof(*properties));
+	/* Newly allocated queues have never been submitted to MES. */
+	tmp_q->mes_queue_removed = true;
 
 	*q = tmp_q;
 	return 0;
@@ -83,6 +86,10 @@ int init_queue(struct queue **q, const struct queue_properties *properties)
 
 void uninit_queue(struct queue *q)
 {
+	if (q) {
+		amdgpu_sb_uncharge(q->sandbox, AMDGPU_SB_QUEUES, 1);
+		amdgpu_sb_put(q->sandbox);
+	}
 	kfree(q);
 }
 
@@ -391,7 +398,8 @@ int kfd_queue_unref_bo_vas(struct kfd_process_device *pdd,
 	int err;
 
 	vm = drm_priv_to_vm(pdd->drm_priv);
-	err = amdgpu_bo_reserve(vm->root.bo, false);
+	/* Reference release is terminal cleanup and must survive signals. */
+	err = amdgpu_bo_reserve(vm->root.bo, true);
 	if (err)
 		return err;
 

@@ -27,6 +27,8 @@
  */
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
+#include <linux/file.h>
 #include <drm/amdgpu_drm.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -1551,13 +1553,22 @@ int amdgpu_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
 		goto out_suspend;
 	}
 
+	fpriv->sandbox = amdgpu_sb_current(adev);
+	if (IS_ERR(fpriv->sandbox)) {
+		r = PTR_ERR(fpriv->sandbox);
+		fpriv->sandbox = NULL;
+		goto error_pasid;
+	}
+	r = amdgpu_sb_check(fpriv->sandbox);
+	if (r)
+		goto error_pasid;
 	r = amdgpu_xcp_open_device(adev, fpriv, file_priv);
 	if (r)
 		goto error_pasid;
 
 	amdgpu_debugfs_vm_init(file_priv);
 
-	r = amdgpu_vm_init(adev, &fpriv->vm, fpriv->xcp_id);
+	r = amdgpu_vm_init(adev, &fpriv->vm, fpriv->xcp_id, fpriv->sandbox);
 	if (r)
 		goto error_pasid;
 
@@ -1623,6 +1634,8 @@ error_vm:
 	amdgpu_vm_fini(adev, &fpriv->vm);
 
 error_pasid:
+	amdgpu_sb_client_del(fpriv->sandbox_client);
+	amdgpu_sb_put(fpriv->sandbox);
 	kfree(fpriv);
 
 out_suspend:
@@ -1695,6 +1708,8 @@ void amdgpu_driver_postclose_kms(struct drm_device *dev,
 		amdgpu_sem_destroy(fpriv, sem_handle);
 	idr_destroy(&fpriv->sem_handles);
 
+	amdgpu_sb_client_del(fpriv->sandbox_client);
+	amdgpu_sb_put(fpriv->sandbox);
 	kfree(fpriv);
 	file_priv->driver_priv = NULL;
 

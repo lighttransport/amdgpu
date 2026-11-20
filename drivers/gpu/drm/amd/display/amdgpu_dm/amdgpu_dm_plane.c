@@ -1233,6 +1233,7 @@ STATIC_IFN_KUNIT int amdgpu_dm_plane_helper_prepare_fb(struct drm_plane *plane,
 	struct amdgpu_bo *rbo;
 	struct dm_plane_state *dm_plane_state_new, *dm_plane_state_old;
 	uint32_t domain;
+	u64 old_flags;
 	int r;
 
 	if (!new_state->fb) {
@@ -1254,6 +1255,7 @@ STATIC_IFN_KUNIT int amdgpu_dm_plane_helper_prepare_fb(struct drm_plane *plane,
 		drm_err(adev_to_drm(adev), "fail to reserve bo: %pe\n", ERR_PTR(r));
 		return r;
 	}
+	old_flags = rbo->flags;
 
 	r = dma_resv_reserve_fences(rbo->tbo.base.resv, TTM_NUM_MOVE_FENCES);
 	if (r) {
@@ -1321,6 +1323,7 @@ error_unpin:
 	amdgpu_bo_unpin(rbo);
 
 error_unlock:
+	rbo->flags = old_flags;
 	amdgpu_bo_unreserve(rbo);
 	return r;
 }

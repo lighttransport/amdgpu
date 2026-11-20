@@ -23,14 +23,18 @@
  */
 
 #include <linux/ratelimit.h>
+#include <linux/iopoll.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
 #include <linux/list.h>
 #include <linux/mmu_context.h>
 #include <linux/types.h>
 #include <linux/bitops.h>
+#include <linux/overflow.h>
 #include <linux/sched.h>
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_mqd_manager.h"
 #include "cik_regs.h"
@@ -47,6 +51,30 @@
 #define CIK_HPD_EOP_BYTES (1U << CIK_HPD_EOP_BYTES_LOG2)
 /* See unmap_queues_cpsch() */
 #define USE_DEFAULT_GRACE_PERIOD 0xffffffff
+#define KFD_SANDBOX_EVICT_TIMEOUT_MS 1000U
+
+/* Runtime queue-state tracing (debug aid, default off):
+ *   echo 1 > /sys/module/amdgpu/parameters/kfd_qtrace  log activity changes
+ *   echo 2 > ...                                        also dump a stack
+ */
+static int kfd_qtrace;
+module_param(kfd_qtrace, int, 0644);
+MODULE_PARM_DESC(kfd_qtrace, "KFD queue state tracing: 0=off (default), 1=log active/MES transitions, 2=also dump stack");
+
+static void kfd_qtrace_log(struct queue *q, const char *what, unsigned long ip)
+{
+	if (likely(!READ_ONCE(kfd_qtrace)))
+		return;
+	pr_info("kfd_qtrace: %s pid=%d qid=%u type=%d db=0x%x active=%d evicted=%d susp=%d removed=%d reset=%d by %pS\n",
+		what, q->process && q->process->lead_thread ?
+			q->process->lead_thread->pid : -1,
+		q->properties.queue_id, q->properties.type,
+		q->properties.doorbell_off, q->properties.is_active,
+		q->properties.is_evicted, q->properties.is_suspended,
+		q->mes_queue_removed, q->properties.is_reset, (void *)ip);
+	if (READ_ONCE(kfd_qtrace) >= 2)
+		dump_stack();
+}
 
 static int set_pasid_vmid_mapping(struct device_queue_manager *dqm,
 				  u32 pasid, unsigned int vmid);
@@ -239,8 +267,18 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	int r, queue_type;
 	uint64_t wptr_addr_off;
 
+	/* A retained failed creation must never be submitted again. */
+	if (q->properties.is_create_failed)
+		return -EIO;
+	/* Covers creation, process restore and whole-device MES restart. */
+	if (amdgpu_sb_check(q->sandbox))
+		return 0;
+
 	if (!dqm->sched_running || dqm->sched_halt)
 		return 0;
+	/* Do not submit a second instance after a failed removal or add. */
+	if (!q->mes_queue_removed)
+		return -EBUSY;
 	if (!down_read_trylock(&adev->reset_domain->sem))
 		return -EIO;
 
@@ -293,10 +331,14 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	queue_input.vm_cntx_cntl = qpd->vm_cntx_cntl;
 	queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
 
+	/* A failed submission may still have reached firmware. */
+	q->mes_queue_removed = false;
+	q->mes_fw_gen = atomic_read(&adev->mes.fw_generation);
 	amdgpu_mes_lock(&adev->mes);
 	r = adev->mes.funcs->add_hw_queue(&adev->mes, &queue_input);
 	amdgpu_mes_unlock(&adev->mes);
 	up_read(&adev->reset_domain->sem);
+	kfd_qtrace_log(q, r ? "mes_add_FAILED" : "mes_add", _RET_IP_);
 	if (r) {
 		dev_err(adev->dev, "failed to add hardware queue to MES, doorbell=0x%x\n",
 			q->properties.doorbell_off);
@@ -316,14 +358,34 @@ static int remove_queue_mes_on_reset_option(struct device_queue_manager *dqm, st
 	int r;
 	struct mes_remove_queue_input queue_input;
 
-	/* queue was already removed during reset */
-	if (q->properties.is_reset)
+	/* A scheduler flag alone does not establish that MES drained this queue. */
+	if (q->properties.is_reset || q->mes_queue_removed) {
+		kfd_qtrace_log(q, "mes_remove_skip", _RET_IP_);
 		return 0;
+	}
 
 	if (!dqm->sched_running || dqm->sched_halt)
-		return 0;
+		return -EIO;
 	if (!down_read_trylock(&adev->reset_domain->sem))
 		return -EIO;
+
+	/*
+	 * MES was reinitialized (GPU reset or resume) since this queue was
+	 * added, so firmware holds no state for it.  REMOVE_QUEUE would time
+	 * out and escalate into another full reset; treat it as drained.
+	 */
+	if (q->mes_fw_gen != (u32)atomic_read(&adev->mes.fw_generation)) {
+		struct kfd_process_device *pdd = qpd_to_pdd(qpd);
+
+		up_read(&adev->reset_domain->sem);
+		dev_info_ratelimited(adev->dev,
+			"MES queue predates MES reinit (gen %u != %u), skipping REMOVE_QUEUE: pid=%d pasid=%u queue=%u doorbell=0x%x\n",
+			q->mes_fw_gen, (u32)atomic_read(&adev->mes.fw_generation),
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
+		q->mes_queue_removed = true;
+		return 0;
+	}
 
 	memset(&queue_input, 0x0, sizeof(struct mes_remove_queue_input));
 	queue_input.doorbell_offset = q->properties.doorbell_off;
@@ -338,12 +400,27 @@ static int remove_queue_mes_on_reset_option(struct device_queue_manager *dqm, st
 	amdgpu_mes_unlock(&adev->mes);
 	up_read(&adev->reset_domain->sem);
 
+	if (!r)
+		q->mes_queue_removed = true;
+	kfd_qtrace_log(q, r ? "mes_remove_FAILED" : "mes_remove", _RET_IP_);
+
 	/* If is_for_reset set, it is a mes internal cleanup */
 	if (!r || is_for_reset)
 		return r;
 
 	/* remove_hw_queue failure indicates a queue hang. reset the queue */
+	{
+		struct kfd_process_device *pdd = qpd_to_pdd(qpd);
+
+		dev_err(adev->dev,
+			"MES remove queue failed: pid=%d pasid=%u queue=%u doorbell=0x%x, attempting queue reset\n",
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
+	}
 	r = reset_queues_mes(dqm, q);
+	/* Reset detection can succeed without finding or removing this queue. */
+	if (!r && !q->properties.is_reset && !q->mes_queue_removed)
+		r = -EIO;
 	if (r && amdgpu_gpu_recovery) {
 		dev_err(adev->dev, "failed to remove queue from MES, doorbell=0x%x\n",
 			q->properties.doorbell_off);
@@ -435,7 +512,14 @@ static int reset_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	if (r)
 		return r;
 	/* Proceed remove_queue with reset=true */
-	remove_queue_mes_on_reset_option(dqm, q, &pdd->qpd, true, true);
+	r = remove_queue_mes_on_reset_option(dqm, q, &pdd->qpd, true, true);
+	if (r) {
+		dev_err(adev->dev,
+			"MES remove queue after reset failed: pid=%d pasid=%u queue=%u doorbell=0x%x\n",
+			pdd->process->lead_thread->pid, pdd->pasid,
+			q->properties.queue_id, q->properties.doorbell_off);
+		return r;
+	}
 	set_queue_as_reset(dqm, q, &pdd->qpd, true);
 	return 0;
 }
@@ -451,6 +535,16 @@ int kfd_reset_queue_mes(struct device_queue_manager *dqm, int queue_type,
 	return reset_queue_mes(dqm, q, queue_type, pipe, queue, db);
 }
 
+/* Call only with the DQM lock and a live, attributable user queue. One
+ * terminal queue lifetime is one incident even if several recovery paths
+ * report it. Unattributed global/HWS recovery is deliberately not charged.
+ */
+static void kfd_queue_sandbox_fault(struct queue *q)
+{
+	if (q->sandbox_context)
+		amdgpu_sb_fault(q->sandbox, q->sandbox_context, 1);
+}
+
 static int reset_queues_mes(struct device_queue_manager *dqm, struct queue *q)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)dqm->dev->adev;
@@ -460,6 +554,8 @@ static int reset_queues_mes(struct device_queue_manager *dqm, struct queue *q)
 	unsigned int num_hung = 0;
 	int r = 0;
 	struct mes_remove_queue_input queue_input;
+
+	lockdep_assert_held(&dqm->lock_hidden);
 
 	if (!amdgpu_mes_queue_reset_by_mes_supported(adev)) {
 		r = -ENOTRECOVERABLE;
@@ -483,6 +579,22 @@ static int reset_queues_mes(struct device_queue_manager *dqm, struct queue *q)
 	queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
 	/* pass the known bad queue info to the reset function */
 	r = amdgpu_gfx_reset_mes_compute(adev, NULL, NULL, NULL, &num_hung, &queue_input);
+	/* MES must positively identify this same queue by doorbell. The
+	 * is_reset flag is only set after this helper returns, so it cannot
+	 * identify a fresh hang; other hung queues must not implicate this
+	 * queue's owner.
+	 */
+	if (num_hung) {
+		unsigned int j;
+
+		for (j = 0; j < num_hung; j++) {
+			if (adev->gfx.mec.mes_hung_db_array[j] ==
+			    q->properties.doorbell_off) {
+				kfd_queue_sandbox_fault(q);
+				break;
+			}
+		}
+	}
 	if (r)
 		goto fail;
 	pdd = kfd_get_process_device_data(q->device, q->process);
@@ -512,10 +624,11 @@ fail:
 	return r;
 }
 
-static void increment_queue_count(struct device_queue_manager *dqm,
-				  struct qcm_process_device *qpd,
-				  struct queue *q)
+static void __increment_queue_count(struct device_queue_manager *dqm,
+				    struct qcm_process_device *qpd,
+				    struct queue *q, unsigned long ip)
 {
+	kfd_qtrace_log(q, "activate", ip);
 	dqm->active_queue_count++;
 	if (q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
 		dqm->active_cp_queue_count++;
@@ -526,10 +639,11 @@ static void increment_queue_count(struct device_queue_manager *dqm,
 	}
 }
 
-static void decrement_queue_count(struct device_queue_manager *dqm,
-				  struct qcm_process_device *qpd,
-				  struct queue *q)
+static void __decrement_queue_count(struct device_queue_manager *dqm,
+				    struct qcm_process_device *qpd,
+				    struct queue *q, unsigned long ip)
 {
+	kfd_qtrace_log(q, "deactivate", ip);
 	dqm->active_queue_count--;
 	if (q->properties.type == KFD_QUEUE_TYPE_COMPUTE)
 		dqm->active_cp_queue_count--;
@@ -539,6 +653,11 @@ static void decrement_queue_count(struct device_queue_manager *dqm,
 		qpd->mapped_gws_queue = false;
 	}
 }
+
+#define increment_queue_count(dqm, qpd, q) \
+	__increment_queue_count(dqm, qpd, q, _THIS_IP_)
+#define decrement_queue_count(dqm, qpd, q) \
+	__decrement_queue_count(dqm, qpd, q, _THIS_IP_)
 
 /*
  * Allocate a doorbell ID to this queue.
@@ -764,6 +883,7 @@ static int create_queue_nocpsch(struct device_queue_manager *dqm,
 {
 	struct mqd_manager *mqd_mgr;
 	int retval;
+	bool reserved = false;
 
 	dqm_lock(dqm);
 
@@ -773,6 +893,10 @@ static int create_queue_nocpsch(struct device_queue_manager *dqm,
 		retval = -EPERM;
 		goto out_unlock;
 	}
+
+	/* Count pending allocations while dropping the lock for MQD allocation. */
+	dqm->total_queue_count++;
+	reserved = true;
 
 	if (list_empty(&qpd->queues_list)) {
 		retval = allocate_vmid(dqm, qpd, q);
@@ -857,11 +981,8 @@ add_queue_to_list:
 	if (q->properties.is_active)
 		increment_queue_count(dqm, qpd, q);
 
-	/*
-	 * Unconditionally increment this counter, regardless of the queue's
-	 * type or whether the queue is active.
-	 */
-	dqm->total_queue_count++;
+	/* The linked queue now owns the capacity reserved above. */
+	reserved = false;
 	pr_debug("Total of %d queues are accountable so far\n",
 			dqm->total_queue_count);
 	goto out_unlock;
@@ -880,6 +1001,8 @@ deallocate_vmid:
 	if (list_empty(&qpd->queues_list))
 		deallocate_vmid(dqm, qpd, q);
 out_unlock:
+	if (reserved)
+		dqm->total_queue_count--;
 	dqm_unlock(dqm);
 	return retval;
 }
@@ -1101,6 +1224,9 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 	struct kfd_process_device *pdd;
 	bool prev_active = false;
 
+	if (q->properties.is_create_failed)
+		return -EIO;
+
 	pdd = kfd_get_process_device_data(q->device, q->process);
 	if (!pdd) {
 		return -ENODEV;
@@ -1149,30 +1275,45 @@ static int update_queue_locked(struct device_queue_manager *dqm, struct queue *q
 		}
 	}
 
+	/* Transition GWS state before programming the MQD. update_cu_mask()
+	 * reads q->properties.is_gws to decide between the full cooperative
+	 * mask and the graphics reservation; doing this after update_mqd()
+	 * left it with the stale value and programmed the wrong mask.
+	 */
+	if (q->gws && !q->properties.is_gws) {
+		/* is_active still holds the pre-update_mqd value here. Account
+		 * the GWS change against that old active state; the active-state
+		 * transition below accounts GWS against the new is_gws value.
+		 * The GwsCountOnce model proves this counts each transition once.
+		 */
+		if (q->properties.is_active &&
+		    q->properties.is_active == prev_active) {
+			dqm->gws_queue_count++;
+			pdd->qpd.mapped_gws_queue = true;
+		}
+		q->properties.is_gws = true;
+	} else if (!q->gws && q->properties.is_gws) {
+		if (q->properties.is_active &&
+		    q->properties.is_active == prev_active) {
+			dqm->gws_queue_count--;
+			pdd->qpd.mapped_gws_queue = false;
+		}
+		q->properties.is_gws = false;
+	}
+
 	mqd_mgr->update_mqd(mqd_mgr, q->mqd, &q->properties, minfo);
 
 	/*
 	 * check active state vs. the previous state and modify
 	 * counter accordingly. map_queues_cpsch uses the
 	 * dqm->active_queue_count to determine whether a new runlist must be
-	 * uploaded.
+	 * uploaded. GWS accounting here covers the active-state-change case
+	 * that the transition block above deliberately leaves out.
 	 */
 	if (q->properties.is_active && !prev_active) {
 		increment_queue_count(dqm, &pdd->qpd, q);
 	} else if (!q->properties.is_active && prev_active) {
 		decrement_queue_count(dqm, &pdd->qpd, q);
-	} else if (q->gws && !q->properties.is_gws) {
-		if (q->properties.is_active) {
-			dqm->gws_queue_count++;
-			pdd->qpd.mapped_gws_queue = true;
-		}
-		q->properties.is_gws = true;
-	} else if (!q->gws && q->properties.is_gws) {
-		if (q->properties.is_active) {
-			dqm->gws_queue_count--;
-			pdd->qpd.mapped_gws_queue = false;
-		}
-		q->properties.is_gws = false;
 	}
 
 	if (dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS) {
@@ -1265,12 +1406,20 @@ static int suspend_single_queue(struct device_queue_manager *dqm,
 		if (dqm->dev->kfd->shared_resources.enable_mes) {
 			int r = remove_queue_mes(dqm, q, &pdd->qpd);
 
-			if (r)
+			if (r) {
+				/* MES did not acknowledge removal; leave the queue active
+				 * and retryable instead of reporting it suspended.
+				 */
+				q->properties.is_suspended = false;
 				return r;
+			}
 		}
 
-		decrement_queue_count(dqm, &pdd->qpd, q);
-		q->properties.is_active = false;
+		/* Queue-reset recovery may already have deactivated this queue. */
+		if (q->properties.is_active) {
+			decrement_queue_count(dqm, &pdd->qpd, q);
+			q->properties.is_active = false;
+		}
 	}
 
 	return 0;
@@ -1325,6 +1474,8 @@ static void dqm_evict_mqd_bo(struct device_queue_manager *dqm, struct queue *q)
 	struct mqd_manager *mqd_mgr;
 	struct amdgpu_bo *bo;
 
+	if (q->needs_mqd_repin)
+		return;
 	if (!dqm->dev->adev->in_s4)
 		return;
 	if (!mqd_on_vram(dqm->dev->adev))
@@ -1355,8 +1506,8 @@ static void dqm_evict_mqd_bo(struct device_queue_manager *dqm, struct queue *q)
 }
 
 /* Repin the MQD BO to VRAM and refresh the cached mapping and GPU addresses.
- * Used both on resume and when a queue is destroyed before resume has repinned
- * it. A no-op unless a repin is owed (needs_mqd_repin set).
+ * Used on resume. Destruction frees an evicted BO without repinning it.
+ * A no-op unless a repin is owed (needs_mqd_repin set).
  */
 static int dqm_repin_mqd_bo(struct device_queue_manager *dqm, struct queue *q)
 {
@@ -1385,6 +1536,8 @@ static int dqm_repin_mqd_bo(struct device_queue_manager *dqm, struct queue *q)
 	/* The BO may have moved; refresh the kernel mapping and gpu address. */
 	amdgpu_bo_kunmap(bo);
 	r = amdgpu_bo_kmap(bo, &cpu_ptr);
+	if (r)
+		amdgpu_bo_unpin(bo);
 	amdgpu_bo_unreserve(bo);
 	if (r) {
 		dev_err(dqm->dev->adev->dev,
@@ -1409,16 +1562,102 @@ static int dqm_repin_mqd_bo(struct device_queue_manager *dqm, struct queue *q)
 	return 0;
 }
 
-static int evict_process_queues_nocpsch(struct device_queue_manager *dqm,
-					struct qcm_process_device *qpd)
+/* The DQM lock protects the aggregate and per-owner reference counts. */
+static int dqm_acquire_eviction_ref(struct qcm_process_device *qpd,
+				    enum kfd_eviction_owner owner,
+				    bool *acquired, bool *first)
+{
+	if (acquired)
+		*acquired = false;
+	if (first)
+		*first = false;
+	if (owner >= KFD_EVICTION_OWNER_COUNT)
+		return -EINVAL;
+	if (qpd->evicted == UINT_MAX ||
+	    qpd->eviction_refs[owner] == UINT_MAX)
+		return -EOVERFLOW;
+
+	if (first)
+		*first = !qpd->evicted;
+	qpd->evicted++;
+	qpd->eviction_refs[owner]++;
+	if (owner == KFD_EVICTION_OWNER_TTM)
+		qpd->ttm_reserved++;
+	if (acquired)
+		*acquired = true;
+
+	return 0;
+}
+
+static bool dqm_has_eviction_ref(struct qcm_process_device *qpd,
+				 enum kfd_eviction_owner owner)
+{
+	if (owner >= KFD_EVICTION_OWNER_COUNT || !qpd->eviction_refs[owner])
+		return false;
+
+	/* Keep the legacy TTM floor as an additional consistency guard. */
+	return owner == KFD_EVICTION_OWNER_TTM ? qpd->ttm_reserved > 0 :
+		qpd->evicted > qpd->ttm_reserved;
+}
+
+static bool dqm_release_eviction_ref(struct qcm_process_device *qpd,
+				     enum kfd_eviction_owner owner,
+				     bool *last)
+{
+	if (last)
+		*last = false;
+	if (!dqm_has_eviction_ref(qpd, owner) ||
+	    WARN_ON_ONCE(!qpd->evicted))
+		return false;
+
+	qpd->evicted--;
+	qpd->eviction_refs[owner]--;
+	if (owner == KFD_EVICTION_OWNER_TTM)
+		qpd->ttm_reserved--;
+	if (last)
+		*last = !qpd->evicted;
+
+	return true;
+}
+
+/* Retry a drain while reusing the exact owner reference from its first try. */
+static int dqm_retry_eviction_ref(struct qcm_process_device *qpd,
+				  enum kfd_eviction_owner owner,
+				  bool *acquired, bool *first)
+{
+	if (acquired)
+		*acquired = false;
+	if (first)
+		*first = false;
+	if (!dqm_has_eviction_ref(qpd, owner))
+		return -ENOENT;
+
+	return 0;
+}
+
+static int evict_process_queues_nocpsch_internal(struct device_queue_manager *dqm,
+						 struct qcm_process_device *qpd,
+						 enum kfd_eviction_owner owner,
+						 bool *acquired,
+						 bool retry, bool once)
 {
 	struct queue *q;
 	struct mqd_manager *mqd_mgr;
 	struct kfd_process_device *pdd;
 	int retval, ret = 0;
+	bool first;
 
+	if (acquired)
+		*acquired = false;
 	dqm_lock(dqm);
-	if (qpd->evicted++ > 0) /* already evicted, do nothing */
+	ret = (retry || (once && dqm_has_eviction_ref(qpd, owner))) ?
+		dqm_retry_eviction_ref(qpd, owner, acquired, &first) :
+		dqm_acquire_eviction_ref(qpd, owner, acquired, &first);
+	if (ret) {
+		dqm_unlock(dqm);
+		return ret;
+	}
+	if (!first && !qpd->eviction_drain_pending)
 		goto out;
 
 	pdd = qpd_to_pdd(qpd);
@@ -1431,13 +1670,15 @@ static int evict_process_queues_nocpsch(struct device_queue_manager *dqm,
 	 */
 	list_for_each_entry(q, &qpd->queues_list, list) {
 		q->properties.is_evicted = true;
-		if (!q->properties.is_active)
+		if (!q->properties.is_active && !q->eviction_drain_pending)
 			continue;
 
 		mqd_mgr = dqm->mqd_mgrs[get_mqd_type_from_queue_type(
 				q->properties.type)];
-		q->properties.is_active = false;
-		decrement_queue_count(dqm, qpd, q);
+		if (q->properties.is_active) {
+			q->properties.is_active = false;
+			decrement_queue_count(dqm, qpd, q);
+		}
 
 		if (WARN_ONCE(!dqm->sched_running, "Evict when stopped\n"))
 			continue;
@@ -1447,28 +1688,62 @@ static int evict_process_queues_nocpsch(struct device_queue_manager *dqm,
 				 KFD_PREEMPT_TYPE_WAVEFRONT_SAVE :
 				 KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN),
 				KFD_UNMAP_LATENCY_MS, q->pipe, q->queue);
+		q->eviction_drain_pending = retval != 0;
 		if (retval && !ret)
 			/* Return the first error, but keep going to
 			 * maintain a consistent eviction state
 			 */
 			ret = retval;
 	}
+	qpd->eviction_drain_pending = ret != 0;
 
 out:
 	dqm_unlock(dqm);
 	return ret;
 }
 
-static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
-				      struct qcm_process_device *qpd)
+static int evict_process_queues_nocpsch(struct device_queue_manager *dqm,
+					struct qcm_process_device *qpd)
+{
+	return evict_process_queues_nocpsch_internal(dqm, qpd,
+						     KFD_EVICTION_OWNER_FAULT,
+						     NULL, false, true);
+}
+
+static int evict_process_queues_nocpsch_ref(struct device_queue_manager *dqm,
+					    struct qcm_process_device *qpd,
+					    enum kfd_eviction_owner owner,
+					    bool *acquired, bool retry)
+{
+	return evict_process_queues_nocpsch_internal(dqm, qpd, owner,
+						     acquired, retry, false);
+}
+
+static int evict_process_queues_cpsch_internal(struct device_queue_manager *dqm,
+					       struct qcm_process_device *qpd,
+					       enum kfd_eviction_owner owner,
+					       bool *acquired,
+					       bool retry, bool once)
 {
 	struct queue *q;
 	struct device *dev = dqm->dev->adev->dev;
 	struct kfd_process_device *pdd;
 	int retval = 0;
+	bool mes = dqm->dev->kfd->shared_resources.enable_mes;
+	bool mes_queues_removed = false;
+	bool first;
 
+	if (acquired)
+		*acquired = false;
 	dqm_lock(dqm);
-	if (qpd->evicted++ > 0) /* already evicted, do nothing */
+	retval = (retry || (once && dqm_has_eviction_ref(qpd, owner))) ?
+		dqm_retry_eviction_ref(qpd, owner, acquired, &first) :
+		dqm_acquire_eviction_ref(qpd, owner, acquired, &first);
+	if (retval) {
+		dqm_unlock(dqm);
+		return retval;
+	}
+	if (!first && !mes && !qpd->eviction_drain_pending)
 		goto out;
 
 	pdd = qpd_to_pdd(qpd);
@@ -1477,53 +1752,72 @@ static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
 	 * all VMs for all devices and has no VMs itself.
 	 * Skip queue eviction on process eviction.
 	 */
-	if (!pdd->drm_priv)
+	if (!pdd->drm_priv) {
+		if (qpd->eviction_drain_pending)
+			retval = -EAGAIN;
 		goto out;
+	}
+
+	/* Keep retries from restoring or unpinning queues after a failed drain. */
+	qpd->eviction_drain_pending = true;
 
 	pr_debug_ratelimited("Evicting process pid %d queues\n",
 			    pdd->process->lead_thread->pid);
 
-	if (dqm->dev->kfd->shared_resources.enable_mes)
+	if (mes)
 		pdd->last_evict_timestamp = get_jiffies_64();
 
-	/* Mark all queues as evicted. Deactivate all active queues on
-	 * the qpd.
-	 */
-	list_for_each_entry(q, &qpd->queues_list, list) {
+	/* Block restore for the whole process even if removal fails part way. */
+	list_for_each_entry(q, &qpd->queues_list, list)
 		q->properties.is_evicted = true;
-		if (!q->properties.is_active)
+
+	list_for_each_entry(q, &qpd->queues_list, list) {
+		if (!q->properties.is_active &&
+		    (!mes || q->mes_queue_removed || q->properties.is_reset))
 			continue;
 
-		q->properties.is_active = false;
-		decrement_queue_count(dqm, qpd, q);
-
-		if (dqm->dev->kfd->shared_resources.enable_mes) {
+		if (mes) {
 			retval = remove_queue_mes(dqm, q, qpd);
 			if (retval) {
 				dev_err(dev, "Failed to evict queue %d\n",
 					q->properties.queue_id);
-				goto out;
+				goto mes_flush;
 			}
+			mes_queues_removed = true;
 		}
 
-		dqm_evict_mqd_bo(dqm, q);
+		/* Queue-reset recovery may already have balanced the active count. */
+		if (q->properties.is_active) {
+			q->properties.is_active = false;
+			decrement_queue_count(dqm, qpd, q);
+		}
 	}
 
-	/*
-	 * Heavy-weight TLB flush after MES removes queues to ensure
-	 * in-flight memory accesses complete before memory is freed/migrated.
-	 * HWS does this automatically, MES does not.
-	 */
-	if (dqm->dev->kfd->shared_resources.enable_mes)
+mes_flush:
+	if (mes && mes_queues_removed) {
+		/* Batch the process flush, but drain partial success before unpinning. */
 		kfd_flush_tlb(pdd);
+		list_for_each_entry(q, &qpd->queues_list, list)
+			if (!q->properties.is_active &&
+			    (q->mes_queue_removed || q->properties.is_reset))
+				dqm_evict_mqd_bo(dqm, q);
+	}
 
-	if (!dqm->dev->kfd->shared_resources.enable_mes) {
+	if (!mes) {
 		pdd->last_evict_timestamp = get_jiffies_64();
 		retval = execute_queues_cpsch(dqm,
 					      qpd->is_debug ?
 					      KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES :
 					      KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0,
 					      USE_DEFAULT_GRACE_PERIOD);
+		if (!retval) {
+			qpd->eviction_drain_pending = false;
+			list_for_each_entry(q, &qpd->queues_list, list)
+				if (!q->properties.is_active)
+					dqm_evict_mqd_bo(dqm, q);
+		}
+	} else if (!retval) {
+		qpd->eviction_drain_pending = false;
 	}
 
 out:
@@ -1576,10 +1870,10 @@ static int clean_process_queues_cpsch(struct device_queue_manager *dqm,
 	}
 
 	retval = unmap_queues_cpsch(dqm,
-			    KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES,
-			    0,
-			    USE_DEFAULT_GRACE_PERIOD,
-			    false);
+				    KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES,
+				    0,
+				    USE_DEFAULT_GRACE_PERIOD,
+				    false);
 
 	if (!retval) {
 		dqm->dev->kfd2kgd->hqd_gfx_clean_fault(dqm->dev->adev);
@@ -1592,8 +1886,27 @@ out:
 	return retval;
 }
 
-static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
-					  struct qcm_process_device *qpd)
+static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
+				      struct qcm_process_device *qpd)
+{
+	return evict_process_queues_cpsch_internal(dqm, qpd,
+						   KFD_EVICTION_OWNER_FAULT,
+						   NULL, false, true);
+}
+
+static int evict_process_queues_cpsch_ref(struct device_queue_manager *dqm,
+					  struct qcm_process_device *qpd,
+					  enum kfd_eviction_owner owner,
+					  bool *acquired, bool retry)
+{
+	return evict_process_queues_cpsch_internal(dqm, qpd, owner,
+						   acquired, retry, false);
+}
+
+static int restore_process_queues_nocpsch_ref(struct device_queue_manager *dqm,
+					      struct qcm_process_device *qpd,
+					      enum kfd_eviction_owner owner,
+					      bool *consumed)
 {
 	struct mm_struct *mm = NULL;
 	struct queue *q;
@@ -1603,15 +1916,38 @@ static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
 	uint64_t eviction_duration;
 	int retval, ret = 0;
 
+	if (consumed)
+		*consumed = false;
+	if (owner >= KFD_EVICTION_OWNER_COUNT)
+		return -EINVAL;
+
 	pdd = qpd_to_pdd(qpd);
+	/* Keep the eviction reference and never re-add quarantined queues. */
+	if (amdgpu_sb_check(pdd->process->sandbox))
+		return 0;
+
 	/* Retrieve PD base */
 	pd_base = amdgpu_amdkfd_gpuvm_get_process_page_dir(pdd->drm_priv);
 
 	dqm_lock(dqm);
+	/* A quarantine worker may have evicted us while we waited. */
+	if (amdgpu_sb_check(pdd->process->sandbox))
+		goto out;
+	/* The previous backend attempt did not confirm the runlist drain. */
+	if (qpd->eviction_drain_pending) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	/* A restore may release only the reference acquired by its owner. */
+	if (!dqm_has_eviction_ref(qpd, owner))
+		goto out;
 	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
 		goto out;
 	if (qpd->evicted > 1) { /* ref count still > 0, decrement & quit */
-		qpd->evicted--;
+		if (WARN_ON_ONCE(!dqm_release_eviction_ref(qpd, owner, NULL)))
+			goto out;
+		if (consumed)
+			*consumed = true;
 		goto out;
 	}
 
@@ -1644,6 +1980,9 @@ static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
 	 */
 	list_for_each_entry(q, &qpd->queues_list, list) {
 		q->properties.is_evicted = false;
+		/* A previous partial restore may already have reactivated it. */
+		if (q->properties.is_active)
+			continue;
 		if (!QUEUE_IS_ACTIVE(q->properties))
 			continue;
 
@@ -1663,7 +2002,10 @@ static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
 			 */
 			ret = retval;
 	}
-	qpd->evicted = 0;
+	if (WARN_ON_ONCE(!dqm_release_eviction_ref(qpd, owner, NULL)))
+		goto out;
+	if (consumed)
+		*consumed = true;
 	eviction_duration = get_jiffies_64() - pdd->last_evict_timestamp;
 	atomic64_add(eviction_duration, &pdd->evict_duration_counter);
 out:
@@ -1673,8 +2015,17 @@ out:
 	return ret;
 }
 
-static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
-					struct qcm_process_device *qpd)
+static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
+					  struct qcm_process_device *qpd)
+{
+	return restore_process_queues_nocpsch_ref(dqm, qpd,
+						   KFD_EVICTION_OWNER_FAULT, NULL);
+}
+
+static int restore_process_queues_cpsch_ref(struct device_queue_manager *dqm,
+					    struct qcm_process_device *qpd,
+						    enum kfd_eviction_owner owner,
+					    bool *consumed)
 {
 	struct queue *q;
 	struct device *dev = dqm->dev->adev->dev;
@@ -1682,13 +2033,36 @@ static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
 	uint64_t eviction_duration;
 	int retval = 0;
 
+	if (consumed)
+		*consumed = false;
+	if (owner >= KFD_EVICTION_OWNER_COUNT)
+		return -EINVAL;
+
 	pdd = qpd_to_pdd(qpd);
+	/* Keep the eviction reference and never re-add quarantined queues. */
+	if (amdgpu_sb_check(pdd->process->sandbox))
+		return 0;
+
 
 	dqm_lock(dqm);
+	/* A quarantine worker may have evicted us while we waited. */
+	if (amdgpu_sb_check(pdd->process->sandbox))
+		goto out;
+	/* Do not re-add queues or consume ownership before a retry drains them. */
+	if (qpd->eviction_drain_pending) {
+		retval = -EAGAIN;
+		goto out;
+	}
+	/* A restore may release only the reference acquired by its owner. */
+	if (!dqm_has_eviction_ref(qpd, owner))
+		goto out;
 	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
 		goto out;
 	if (qpd->evicted > 1) { /* ref count still > 0, decrement & quit */
-		qpd->evicted--;
+		if (WARN_ON_ONCE(!dqm_release_eviction_ref(qpd, owner, NULL)))
+			goto out;
+		if (consumed)
+			*consumed = true;
 		goto out;
 	}
 
@@ -1709,18 +2083,44 @@ static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
 	/* activate all active queues on the qpd */
 	list_for_each_entry(q, &qpd->queues_list, list) {
 		q->properties.is_evicted = false;
+		/* A previous partial restore may already have reactivated it.
+		 * Under MES, "active" only means the driver counts the queue;
+		 * if firmware no longer holds it (removed by a whole-device
+		 * remove/halt or an earlier partial eviction) it must be
+		 * re-added, or the process waits forever on work that is
+		 * never scheduled.
+		 */
+		if (q->properties.is_active) {
+			/* halt_cpsch() removes active queues on purpose;
+			 * unhalt_cpsch() re-adds them.
+			 */
+			if (!dqm->dev->kfd->shared_resources.enable_mes ||
+			    dqm->sched_halt || !q->mes_queue_removed ||
+			    q->properties.is_reset ||
+			    !QUEUE_IS_ACTIVE(q->properties))
+				continue;
+			kfd_qtrace_log(q, "restore_readd_removed", _THIS_IP_);
+			retval = add_queue_mes(dqm, q, qpd);
+			if (retval) {
+				dev_err(dev, "Failed to re-add queue %d\n",
+					q->properties.queue_id);
+				goto out;
+			}
+			continue;
+		}
 		if (!QUEUE_IS_ACTIVE(q->properties))
 			continue;
 
-		q->properties.is_active = true;
-		increment_queue_count(dqm, &pdd->qpd, q);
-
 		retval = dqm_repin_mqd_bo(dqm, q);
 		if (retval) {
+			q->properties.is_evicted = true;
 			dev_err(dev, "Failed to repin MQD for queue %d\n",
 				q->properties.queue_id);
 			goto out;
 		}
+
+		q->properties.is_active = true;
+		increment_queue_count(dqm, &pdd->qpd, q);
 
 		if (dqm->dev->kfd->shared_resources.enable_mes) {
 			retval = add_queue_mes(dqm, q, qpd);
@@ -1737,10 +2137,20 @@ static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
 	eviction_duration = get_jiffies_64() - pdd->last_evict_timestamp;
 	atomic64_add(eviction_duration, &pdd->evict_duration_counter);
 vm_not_acquired:
-	qpd->evicted = 0;
+	if (WARN_ON_ONCE(!dqm_release_eviction_ref(qpd, owner, NULL)))
+		goto out;
+	if (consumed)
+		*consumed = true;
 out:
 	dqm_unlock(dqm);
 	return retval;
+}
+
+static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
+					struct qcm_process_device *qpd)
+{
+	return restore_process_queues_cpsch_ref(dqm, qpd,
+						 KFD_EVICTION_OWNER_FAULT, NULL);
 }
 
 static int register_process(struct device_queue_manager *dqm,
@@ -1896,13 +2306,20 @@ static int start_nocpsch(struct device_queue_manager *dqm)
 {
 	int r = 0;
 
-	pr_info("SW scheduler is used");
-	init_interrupts(dqm);
+	dqm_lock(dqm);
+	if (dqm->sched_running) {
+		dqm_unlock(dqm);
+		return 0;
+	}
 
+	pr_info("SW scheduler is used");
 	if (dqm->dev->adev->asic_type == CHIP_HAWAII)
 		r = pm_init(&dqm->packet_mgr, dqm);
-	if (!r)
+	if (!r) {
+		init_interrupts(dqm);
 		dqm->sched_running = true;
+	}
+	dqm_unlock(dqm);
 
 	return r;
 }
@@ -2214,12 +2631,14 @@ static int init_dequeue_wait_counts_mes(struct device_queue_manager *dqm)
 static int start_cpsch(struct device_queue_manager *dqm)
 {
 	struct device *dev = dqm->dev->adev->dev;
-	int retval, num_hw_queue_slots;
-	struct amdgpu_device *adev = (struct amdgpu_device *)dqm->dev->adev;
-	int hung_array_size = amdgpu_mes_get_hung_queue_db_array_size(adev);
-	int hqd_info_size = adev->mes.hung_queue_hqd_info_offset;
+	int retval;
+	size_t num_hw_queue_slots;
 
 	dqm_lock(dqm);
+	if (dqm->sched_running) {
+		dqm_unlock(dqm);
+		return 0;
+	}
 
 	if (!dqm->dev->kfd->shared_resources.enable_mes) {
 		retval = pm_init(&dqm->packet_mgr, dqm);
@@ -2233,7 +2652,7 @@ static int start_cpsch(struct device_queue_manager *dqm)
 	pr_debug("Allocating fence memory\n");
 
 	/* allocate fence memory on the gart */
-	retval = kfd_gtt_sa_allocate(dqm->dev, sizeof(*dqm->fence_addr),
+	retval = kfd_gtt_sa_allocate(dqm->dev, 2 * sizeof(*dqm->fence_addr),
 					&dqm->fence_mem);
 
 	if (retval)
@@ -2241,6 +2660,28 @@ static int start_cpsch(struct device_queue_manager *dqm)
 
 	dqm->fence_addr = (uint64_t *)dqm->fence_mem->cpu_ptr;
 	dqm->fence_gpu_addr = dqm->fence_mem->gpu_addr;
+
+	/* Allocate recovery state before publishing scheduler readiness. */
+	if (check_mul_overflow((size_t)dqm->dev->kfd->shared_resources.num_queue_per_pipe,
+			       (size_t)dqm->dev->kfd->shared_resources.num_pipe_per_mec,
+			       &num_hw_queue_slots) ||
+	    check_mul_overflow(num_hw_queue_slots, (size_t)NUM_XCC(dqm->dev->xcc_mask),
+			       &num_hw_queue_slots) ||
+	    check_mul_overflow(num_hw_queue_slots, sizeof(*dqm->detect_hang_info),
+			       &dqm->detect_hang_info_size)) {
+		retval = -EOVERFLOW;
+		goto fail_detect_hang_buffer;
+	}
+	if (!num_hw_queue_slots) {
+		retval = -EINVAL;
+		goto fail_detect_hang_buffer;
+	}
+	dqm->detect_hang_info = kcalloc(num_hw_queue_slots,
+					sizeof(*dqm->detect_hang_info), GFP_KERNEL);
+	if (!dqm->detect_hang_info) {
+		retval = -ENOMEM;
+		goto fail_detect_hang_buffer;
+	}
 
 	init_interrupts(dqm);
 
@@ -2257,29 +2698,15 @@ static int start_cpsch(struct device_queue_manager *dqm)
 			dev_err(dev, "Setting optimized dequeue wait failed. Using default values\n");
 	}
 
-	/* setup per-queue reset detection buffer  */
-	num_hw_queue_slots =  dqm->dev->kfd->shared_resources.num_queue_per_pipe *
-			      dqm->dev->kfd->shared_resources.num_pipe_per_mec *
-			      NUM_XCC(dqm->dev->xcc_mask);
-
-	dqm->detect_hang_info_size = num_hw_queue_slots * sizeof(struct dqm_detect_hang_info);
-	dqm->detect_hang_info = kzalloc(dqm->detect_hang_info_size, GFP_KERNEL);
-
-	if (!dqm->detect_hang_info) {
-		retval = -ENOMEM;
-		goto fail_detect_hang_buffer;
-	}
-
-	dqm->hung_db_array = kzalloc(hung_array_size * sizeof(u32), GFP_KERNEL);
-	dqm->hqd_info = kzalloc(
-		hqd_info_size * sizeof(struct amdgpu_mes_hung_queue_hqd_info),
-		GFP_KERNEL);
-
 	dqm_unlock(dqm);
 
 	return 0;
 fail_detect_hang_buffer:
 	kfd_gtt_sa_free(dqm->dev, dqm->fence_mem);
+	dqm->fence_mem = NULL;
+	dqm->fence_addr = NULL;
+	dqm->fence_gpu_addr = 0;
+	dqm->detect_hang_info_size = 0;
 fail_allocate_vidmem:
 fail_set_sched_resources:
 	if (!dqm->dev->kfd->shared_resources.enable_mes)
@@ -2304,6 +2731,11 @@ static int stop_cpsch(struct device_queue_manager *dqm)
 								0, USE_DEFAULT_GRACE_PERIOD, false);
 	else
 		ret = remove_all_kfd_queues_mes(dqm);
+	/* Keep every scheduler resource alive until the queue drain succeeds. */
+	if (ret) {
+		dqm_unlock(dqm);
+		return ret;
+	}
 
 	dqm->sched_running = false;
 
@@ -2315,8 +2747,10 @@ static int stop_cpsch(struct device_queue_manager *dqm)
 		pm_uninit(&dqm->packet_mgr);
 	kfree(dqm->detect_hang_info);
 	dqm->detect_hang_info = NULL;
-	kfree(dqm->hung_db_array);
-	kfree(dqm->hqd_info);
+	dqm->detect_hang_info_size = 0;
+	dqm->fence_mem = NULL;
+	dqm->fence_addr = NULL;
+	dqm->fence_gpu_addr = 0;
 
 	dqm_unlock(dqm);
 
@@ -2381,12 +2815,16 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
 	int retval;
 	struct mqd_manager *mqd_mgr;
 
+	dqm_lock(dqm);
 	if (dqm->total_queue_count >= max_num_of_queues_per_device) {
 		pr_warn("Can't create new usermode queue because %d queues were already created\n",
 				dqm->total_queue_count);
-		retval = -EPERM;
-		goto out;
+		dqm_unlock(dqm);
+		return -EPERM;
 	}
+	/* Reserve before any allocation drops the DQM lock or can sleep. */
+	dqm->total_queue_count++;
+	dqm_unlock(dqm);
 
 	if (q->properties.type == KFD_QUEUE_TYPE_SDMA ||
 		q->properties.type == KFD_QUEUE_TYPE_SDMA_XGMI ||
@@ -2455,11 +2893,7 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
 			goto cleanup_queue;
 	}
 
-	/*
-	 * Unconditionally increment this counter, regardless of the queue's
-	 * type or whether the queue is active.
-	 */
-	dqm->total_queue_count++;
+	/* The linked queue owns the capacity reserved at entry. */
 
 	pr_debug("Total of %d queues are accountable so far\n",
 			dqm->total_queue_count);
@@ -2468,6 +2902,21 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
 	return retval;
 
 cleanup_queue:
+	if (dqm->dev->kfd->shared_resources.enable_mes && !q->mes_queue_removed) {
+		int remove_ret = remove_queue_mes(dqm, q, qpd);
+
+		if (remove_ret) {
+			/* Firmware may still use every queue resource. Keep the DQM
+			 * owner and charge; PQM must retain the caller's buffers too.
+			 */
+			q->properties.is_create_failed = true;
+			q->properties.is_evicted = true;
+			/* Retained failures keep their existing capacity reservation. */
+			dqm_unlock(dqm);
+			return retval;
+		}
+		kfd_flush_tlb(qpd_to_pdd(qpd));
+	}
 	qpd->queue_count--;
 	list_del(&q->list);
 	if (q->properties.is_active)
@@ -2484,6 +2933,9 @@ out_deallocate_sdma_queue:
 		dqm_unlock(dqm);
 	}
 out:
+	dqm_lock(dqm);
+	dqm->total_queue_count--;
+	dqm_unlock(dqm);
 	return retval;
 }
 
@@ -2553,6 +3005,7 @@ static void set_queue_as_reset(struct device_queue_manager *dqm, struct queue *q
 			q->properties.queue_id, pdd->process->lead_thread->pid);
 
 	pdd->has_reset_queue = true;
+	q->mes_queue_removed = true;
 	q->properties.is_reset = true;
 	if (q->properties.is_active) {
 		q->properties.is_active = false;
@@ -2825,15 +3278,18 @@ static int reset_queues_on_hws_hang(struct device_queue_manager *dqm, bool is_sd
  *   This is configured by setting CP_IQ_WAIT_TIME2.SCH_WAVE
  *
  */
-static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+static int unmap_queues_cpsch_impl(struct device_queue_manager *dqm,
 				enum kfd_unmap_queues_filter filter,
 				uint32_t filter_param,
 				uint32_t grace_period,
-				bool reset)
+				bool reset, bool allow_recovery)
 {
 	struct device *dev = dqm->dev->adev->dev;
 	struct mqd_manager *mqd_mgr;
 	int retval;
+	u64 fence, expected;
+	u64 *query_fence;
+	u64 query_gpu_addr;
 
 	if (!dqm->sched_running)
 		return 0;
@@ -2841,6 +3297,22 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
 		return 0;
 	if (!down_read_trylock(&dqm->dev->adev->reset_domain->sem))
 		return -EIO;
+
+	query_fence = dqm->fence_addr;
+	query_gpu_addr = dqm->fence_gpu_addr;
+	expected = KFD_FENCE_COMPLETED;
+	if (!allow_recovery) {
+		/* A timed-out query can write much later. Its dedicated persistent
+		 * slot and unique value must never satisfy a normal/next query.
+		 */
+		if (dqm->sandbox_fence_seq == U64_MAX) {
+			retval = -EOVERFLOW;
+			goto out;
+		}
+		expected = ++dqm->sandbox_fence_seq;
+		query_fence++;
+		query_gpu_addr += sizeof(*query_fence);
+	}
 
 	if (grace_period != USE_DEFAULT_GRACE_PERIOD) {
 		retval = pm_config_dequeue_wait_counts(&dqm->packet_mgr,
@@ -2852,16 +3324,23 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
 	if (retval)
 		goto out;
 
-	*dqm->fence_addr = KFD_FENCE_INIT;
+	WRITE_ONCE(*query_fence, allow_recovery ? KFD_FENCE_INIT : 0);
 	mb();
-	pm_send_query_status(&dqm->packet_mgr, dqm->fence_gpu_addr,
-				KFD_FENCE_COMPLETED);
-	/* should be timed out */
-	retval = amdkfd_fence_wait_timeout(dqm, KFD_FENCE_COMPLETED,
-					   queue_preemption_timeout_ms);
+	retval = pm_send_query_status(&dqm->packet_mgr, query_gpu_addr, expected);
+	if (retval && !allow_recovery)
+		goto out;
+	if (allow_recovery)
+		retval = amdkfd_fence_wait_timeout(dqm, KFD_FENCE_COMPLETED,
+						   queue_preemption_timeout_ms);
+	else
+		/* A sandbox worker must never enter the firmware-debug halt loop. */
+		retval = read_poll_timeout(READ_ONCE, fence,
+			fence == expected, 100,
+			KFD_SANDBOX_EVICT_TIMEOUT_MS * 1000UL, false, *query_fence);
 	if (retval) {
 		dev_err(dev, "The cp might be in an unrecoverable state due to an unsuccessful queues preemption\n");
-		kfd_hws_hang(dqm);
+		if (allow_recovery)
+			kfd_hws_hang(dqm);
 		goto out;
 	}
 
@@ -2874,13 +3353,24 @@ static int unmap_queues_cpsch(struct device_queue_manager *dqm,
 	 * check those fields
 	 */
 	mqd_mgr = dqm->mqd_mgrs[KFD_MQD_TYPE_HIQ];
-	if (mqd_mgr->check_preemption_failed(mqd_mgr, dqm->packet_mgr.priv_queue->queue->mqd) &&
-	    reset_queues_on_hws_hang(dqm, false))
-		goto reset_fail;
+	if (mqd_mgr->check_preemption_failed(mqd_mgr, dqm->packet_mgr.priv_queue->queue->mqd)) {
+		if (!allow_recovery) {
+			retval = -ETIME;
+			goto out;
+		}
+		if (reset_queues_on_hws_hang(dqm, false))
+			goto reset_fail;
+	}
 
-	/* Check for SDMA hang and attempt SDMA reset */
-	if (sdma_has_hang(dqm) && reset_queues_on_hws_hang(dqm, true))
-		goto reset_fail;
+	/* Check for SDMA hang and attempt SDMA reset only for normal recovery. */
+	if (sdma_has_hang(dqm)) {
+		if (!allow_recovery) {
+			retval = -ETIME;
+			goto out;
+		}
+		if (reset_queues_on_hws_hang(dqm, true))
+			goto reset_fail;
+	}
 
 	/* We need to reset the grace period value for this device */
 	if (grace_period != USE_DEFAULT_GRACE_PERIOD) {
@@ -2900,6 +3390,15 @@ reset_fail:
 	kfd_hws_hang(dqm);
 	up_read(&dqm->dev->adev->reset_domain->sem);
 	return -ETIME;
+}
+
+static int unmap_queues_cpsch(struct device_queue_manager *dqm,
+				enum kfd_unmap_queues_filter filter,
+				uint32_t filter_param,
+				uint32_t grace_period, bool reset)
+{
+	return unmap_queues_cpsch_impl(dqm, filter, filter_param, grace_period,
+				     reset, true);
 }
 
 /* only for compute queue */
@@ -3018,6 +3517,21 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 	mqd_mgr = dqm->mqd_mgrs[get_mqd_type_from_queue_type(
 			q->properties.type)];
 
+	/* Software inactivity does not certify MES removal after eviction failure. */
+	if (dqm->dev->kfd->shared_resources.enable_mes) {
+		retval = remove_queue_mes(dqm, q, qpd);
+		if (retval) {
+			/* Keep the queue and its resources accounted until MES removal
+			 * or a queue reset has been acknowledged.
+			 */
+			q->properties.is_being_destroyed = false;
+			dqm_unlock(dqm);
+			return retval;
+		}
+		/* MES removal alone does not drain in-flight memory accesses. */
+		kfd_flush_tlb(pdd);
+	}
+
 	deallocate_doorbell(qpd, q);
 
 	if ((q->properties.type == KFD_QUEUE_TYPE_SDMA) ||
@@ -3035,8 +3549,6 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 						      USE_DEFAULT_GRACE_PERIOD);
 			if (retval == -ETIME)
 				qpd->reset_wavefronts = true;
-		} else {
-			retval = remove_queue_mes(dqm, q, qpd);
 		}
 	}
 	list_del(&q->list);
@@ -3060,8 +3572,7 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 				qpd->pqm->process, q->device,
 				-1, false, NULL, 0);
 
-	/* Repin the MQD BO if still evicted for hibernation, before it is freed. */
-	dqm_repin_mqd_bo(dqm, q);
+	/* Freeing an evicted MQD needs neither a mapping nor a new VRAM charge. */
 	mqd_mgr->free_mqd(mqd_mgr, q->mqd, q->mqd_mem_obj);
 
 	return retval;
@@ -3319,8 +3830,7 @@ static int process_termination_cpsch(struct device_queue_manager *dqm,
 		list_del(&q->list);
 		qpd->queue_count--;
 		dqm_unlock(dqm);
-		/* Repin the MQD BO if still evicted for hibernation, before free. */
-		dqm_repin_mqd_bo(dqm, q);
+		/* An evicted MQD can be freed without repinning. */
 		mqd_mgr->free_mqd(mqd_mgr, q->mqd, q->mqd_mem_obj);
 		dqm_lock(dqm);
 	}
@@ -3437,7 +3947,11 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_node *dev)
 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
 		dqm->ops.process_termination = process_termination_cpsch;
 		dqm->ops.evict_process_queues = evict_process_queues_cpsch;
+		dqm->ops.evict_process_queues_ref =
+			evict_process_queues_cpsch_ref;
 		dqm->ops.restore_process_queues = restore_process_queues_cpsch;
+		dqm->ops.restore_process_queues_ref =
+			restore_process_queues_cpsch_ref;
 		dqm->ops.get_wave_state = get_wave_state;
 		dqm->ops.reset_queues = reset_queues_cpsch;
 		dqm->ops.get_queue_checkpoint_info = get_queue_checkpoint_info;
@@ -3459,8 +3973,12 @@ struct device_queue_manager *device_queue_manager_init(struct kfd_node *dev)
 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
 		dqm->ops.process_termination = process_termination_nocpsch;
 		dqm->ops.evict_process_queues = evict_process_queues_nocpsch;
+		dqm->ops.evict_process_queues_ref =
+			evict_process_queues_nocpsch_ref;
 		dqm->ops.restore_process_queues =
 			restore_process_queues_nocpsch;
+		dqm->ops.restore_process_queues_ref =
+			restore_process_queues_nocpsch_ref;
 		dqm->ops.get_wave_state = get_wave_state;
 		dqm->ops.get_queue_checkpoint_info = get_queue_checkpoint_info;
 		dqm->ops.checkpoint_mqd = checkpoint_mqd;
@@ -3532,7 +4050,19 @@ out_free:
 
 void device_queue_manager_uninit(struct device_queue_manager *dqm)
 {
-	dqm->ops.stop(dqm);
+	int r;
+
+	/* A failed stop cannot transfer ownership of MQDs or the DQM to free. */
+	do {
+		r = dqm->ops.stop(dqm);
+		if (r) {
+			dev_err_ratelimited(dqm->dev->adev->dev,
+					    "DQM stop failed (%d); retaining resources and retrying\n",
+					    r);
+			msleep(100);
+		}
+	} while (r);
+
 	dqm->ops.uninitialize(dqm);
 	if (!dqm->dev->kfd->shared_resources.enable_mes)
 		deallocate_hiq_sdma_mqd(dqm->dev, &dqm->hiq_sdma_mqd);
@@ -3549,8 +4079,14 @@ int kfd_dqm_suspend_bad_queue_mes(struct kfd_node *knode, u32 pasid, u32 doorbel
 	struct queue *q = NULL;
 	int ret = 0;
 
-	if (!pdd)
+	if (!p)
 		return -EINVAL;
+	/* A process PASID alone is insufficient when it has several devices. */
+	pdd = kfd_get_process_device_data(knode, p);
+	if (!pdd) {
+		kfd_unref_process(p);
+		return -EINVAL;
+	}
 
 	dqm_lock(dqm);
 
@@ -3559,10 +4095,21 @@ int kfd_dqm_suspend_bad_queue_mes(struct kfd_node *knode, u32 pasid, u32 doorbel
 
 		list_for_each_entry(q, &qpd->queues_list, list) {
 			if (q->doorbell_id == doorbell_id && q->properties.is_active) {
-				reset_queues_mes(dqm, q);
+				/* A terminal CP packet exception names PASID and doorbell;
+				 * ordinary SVM retry/VM faults never enter this path.
+				 */
+				kfd_queue_sandbox_fault(q);
+				ret = reset_queues_mes(dqm, q);
+				if (!ret && !q->properties.is_reset && !q->mes_queue_removed)
+					ret = -EIO;
+				if (ret)
+					break;
 				q->properties.is_evicted = true;
-				q->properties.is_active = false;
-				decrement_queue_count(dqm, qpd, q);
+				/* Reset marking can already have deactivated this queue. */
+				if (q->properties.is_active) {
+					q->properties.is_active = false;
+					decrement_queue_count(dqm, qpd, q);
+				}
 				break;
 			}
 		}
@@ -3584,6 +4131,115 @@ int kfd_evict_process_device(struct kfd_process_device *pdd)
 	WARN(debug_evictions, "Evicting pid %d", p->lead_thread->pid);
 
 	return dqm->ops.evict_process_queues(dqm, &pdd->qpd);
+}
+
+/* Best-effort quarantine only. Keep memory and hardware-active accounting
+ * intact on failure so normal teardown can still perform required recovery.
+ * Unlike ordinary eviction, this path must never initiate queue/GPU reset.
+ */
+int kfd_sandbox_evict_process_device(struct kfd_process_device *pdd)
+{
+	struct device_queue_manager *dqm = pdd->dev->dqm;
+	struct qcm_process_device *qpd = &pdd->qpd;
+	struct queue *q;
+	unsigned long deadline;
+	bool mes = dqm->dev->kfd->shared_resources.enable_mes;
+	bool hws = dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS;
+	int ret = 0, r;
+
+	if (!pdd->process->sandbox ||
+	    !amdgpu_sb_allows(pdd->process->sandbox, pdd->dev->adev))
+		return -EXDEV;
+	r = amdgpu_sb_check(pdd->process->sandbox);
+	if (r != -EACCES)
+		return r ? r : -EINVAL;
+	if (!dqm_trylock(dqm))
+		return -EAGAIN;
+	if (!pdd->drm_priv)
+		goto out;
+	if (!dqm->sched_running || dqm->sched_halt) {
+		/* Scheduling state is not proof that every queue was drained. */
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	deadline = jiffies + msecs_to_jiffies(KFD_SANDBOX_EVICT_TIMEOUT_MS);
+	list_for_each_entry(q, &qpd->queues_list, list)
+		q->properties.is_evicted = true;
+
+	if (hws && !mes) {
+		/* Retire the old HWS runlist before rebuilding it without this
+		 * policy. Keeping an old chained IB could re-add quarantined work.
+		 * Other processes are remapped; no recovery/reset is requested.
+		 */
+		ret = unmap_queues_cpsch_impl(dqm,
+			qpd->is_debug ? KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES :
+			KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES,
+			0, USE_DEFAULT_GRACE_PERIOD, false, false);
+		if (ret)
+			goto out;
+	}
+
+	list_for_each_entry(q, &qpd->queues_list, list) {
+		struct mqd_manager *mqd_mgr;
+
+		if (!q->properties.is_active)
+			continue;
+		if (mes) {
+			if (time_after_eq(jiffies, deadline)) {
+				ret = -ETIME;
+				break;
+			}
+			r = remove_queue_mes_on_reset_option(dqm, q, qpd, true, false);
+		} else if (!hws) {
+			unsigned int remaining;
+
+			if (time_after_eq(jiffies, deadline)) {
+				ret = -ETIME;
+				break;
+			}
+			remaining = max_t(unsigned int, 1,
+					  jiffies_to_msecs(deadline - jiffies));
+			mqd_mgr = dqm->mqd_mgrs[get_mqd_type_from_queue_type(q->properties.type)];
+			r = mqd_mgr->destroy_mqd(mqd_mgr, q->mqd,
+				(dqm->dev->kfd->cwsr_enabled ?
+				 KFD_PREEMPT_TYPE_WAVEFRONT_SAVE :
+				 KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN),
+				remaining, q->pipe, q->queue);
+		} else {
+			r = 0;
+		}
+		if (r) {
+			if (!ret)
+				ret = r;
+			continue;
+		}
+		/* Complete this queue's in-flight memory accesses even if a later
+		 * queue fails. No backing object is unpinned by this worker.
+		 */
+		if (mes)
+			kfd_flush_tlb(pdd);
+		q->properties.is_active = false;
+		decrement_queue_count(dqm, qpd, q);
+	}
+	if (!ret) {
+		/* Quarantine owns a sticky per-device reference. It must not be
+		 * consumed by a concurrent SVM, userptr or suspend restore.
+		 */
+		if (!dqm_has_eviction_ref(qpd, KFD_EVICTION_OWNER_QUARANTINE))
+			ret = dqm_acquire_eviction_ref(qpd,
+						       KFD_EVICTION_OWNER_QUARANTINE,
+						       NULL, NULL);
+		pdd->last_evict_timestamp = get_jiffies_64();
+	}
+	if (hws && !mes) {
+		r = map_queues_cpsch(dqm);
+		if (r && !ret)
+			ret = r;
+	}
+out:
+	dqm_unlock(dqm);
+	return ret;
 }
 
 int reserve_debug_trap_vmid(struct device_queue_manager *dqm,
@@ -4244,4 +4900,79 @@ int dqm_debugfs_hang_hws(struct device_queue_manager *dqm)
 	return r;
 }
 
+#endif
+
+#if defined(CONFIG_DEBUG_FS)
+static const char *const kfd_evict_owner_names[KFD_EVICTION_OWNER_COUNT] = {
+	"svm", "userptr", "ttm", "suspend", "criu_ckpt", "criu_rst",
+	"quarantine", "fault",
+};
+
+/* Print (and with @repair, re-add) the queue state of one process device.
+ * Repair only touches a process that holds no eviction reference: any queue
+ * that should run (QUEUE_IS_ACTIVE) but is not active or no longer held by
+ * MES is re-activated and re-added. Returns the number of repaired queues.
+ */
+int dqm_debugfs_qstate(struct seq_file *m, struct kfd_process_device *pdd,
+		       bool repair)
+{
+	struct device_queue_manager *dqm = pdd->dev->dqm;
+	struct qcm_process_device *qpd = &pdd->qpd;
+	bool mes = dqm->dev->kfd->shared_resources.enable_mes;
+	struct queue *q;
+	int i, fixed = 0;
+
+	dqm_lock(dqm);
+	if (m) {
+		seq_printf(m, "  gpu_id 0x%x qpd %px evicted=%u drain_pending=%d drm_priv=%d sched_running=%d sched_halt=%d active_queue_count=%d\n",
+			   pdd->dev->id, qpd, qpd->evicted,
+			   qpd->eviction_drain_pending, !!pdd->drm_priv,
+			   dqm->sched_running, dqm->sched_halt,
+			   dqm->active_queue_count);
+		seq_puts(m, "   refs:");
+		for (i = 0; i < KFD_EVICTION_OWNER_COUNT; i++)
+			if (qpd->eviction_refs[i])
+				seq_printf(m, " %s=%u", kfd_evict_owner_names[i],
+					   qpd->eviction_refs[i]);
+		seq_puts(m, "\n");
+	}
+	list_for_each_entry(q, &qpd->queues_list, list) {
+		bool should_run = QUEUE_IS_ACTIVE(q->properties);
+
+		if (m)
+			seq_printf(m, "   qid %u type %d db 0x%x pct %u should_run=%d active=%d evicted=%d susp=%d destroying=%d removed=%d reset=%d fw_gen=%u/%u%s\n",
+				   q->properties.queue_id, q->properties.type,
+				   q->properties.doorbell_off,
+				   q->properties.queue_percent, should_run,
+				   q->properties.is_active,
+				   q->properties.is_evicted,
+				   q->properties.is_suspended,
+				   q->properties.is_being_destroyed,
+				   q->mes_queue_removed, q->properties.is_reset,
+				   q->mes_fw_gen,
+				   (u32)atomic_read(&dqm->dev->adev->mes.fw_generation),
+				   should_run && !qpd->evicted &&
+				   (!q->properties.is_active ||
+				    (mes && q->mes_queue_removed)) ?
+				   "  <-- STRANDED" : "");
+		if (!repair || qpd->evicted || !mes || !should_run ||
+		    q->properties.is_reset || !dqm->sched_running ||
+		    dqm->sched_halt)
+			continue;
+		if (q->properties.is_active && !q->mes_queue_removed)
+			continue;
+		if (!q->properties.is_active) {
+			q->properties.is_active = true;
+			increment_queue_count(dqm, qpd, q);
+		}
+		kfd_qtrace_log(q, "debugfs_repair", _THIS_IP_);
+		if (add_queue_mes(dqm, q, qpd))
+			pr_err("kfd queue_state: repair of queue %u failed\n",
+			       q->properties.queue_id);
+		else
+			fixed++;
+	}
+	dqm_unlock(dqm);
+	return fixed;
+}
 #endif

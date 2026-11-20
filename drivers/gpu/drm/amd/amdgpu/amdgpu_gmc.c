@@ -411,14 +411,26 @@ void amdgpu_gmc_set_agp_default(struct amdgpu_device *adev,
 }
 
 /**
- * amdgpu_gmc_fault_key - get hask key from vm fault address and pasid
+ * amdgpu_gmc_fault_key - get hash key from address, PASID and source
  *
- * @addr: 48 bit physical address, page aligned (36 significant bits)
+ * @addr: up to 57 bit GPU virtual address, page aligned
  * @pasid: 16 bit process address space identifier
+ * @vmid_src: one-bit IH VMID source (GFXHUB or MMHUB domain)
+ *
+ * Layout: [61:17] page number | [16:1] pasid | [0] VMID source.
+ * Packing the source bit, rather than four hub bits, preserves address bit 56.
+ *
+ * The hub has to participate in the key: a gfxhub and a mmhub fault on the
+ * same address and PASID must be dedupe-separated, otherwise only the first
+ * runs through the retry/restore recovery path and the other is silently
+ * dropped for the whole AMDGPU_GMC_FAULT_TIMEOUT window.
  */
-static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid)
+static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid,
+					    uint32_t vmid_src)
 {
-	return addr << 4 | pasid;
+	return ((addr >> AMDGPU_GPU_PAGE_SHIFT) << 17) |
+	       ((uint64_t)pasid << 1) |
+	       (vmid_src & 1);
 }
 
 /**
@@ -429,6 +441,7 @@ static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid)
  * @addr: address of the VM fault
  * @pasid: PASID of the process causing the fault
  * @timestamp: timestamp of the fault
+ * @vmid_src: one-bit IH VMID source (dedupe key component)
  *
  * Returns:
  * True if the fault was filtered and should not be processed further.
@@ -436,10 +449,11 @@ static inline uint64_t amdgpu_gmc_fault_key(uint64_t addr, uint16_t pasid)
  */
 bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
 			      struct amdgpu_ih_ring *ih, uint64_t addr,
-			      uint16_t pasid, uint64_t timestamp)
+			      uint16_t pasid, uint64_t timestamp,
+			      uint32_t vmid_src)
 {
 	struct amdgpu_gmc *gmc = &adev->gmc;
-	uint64_t stamp, key = amdgpu_gmc_fault_key(addr, pasid);
+	uint64_t stamp, key = amdgpu_gmc_fault_key(addr, pasid, vmid_src);
 	struct amdgpu_gmc_fault *fault;
 	uint32_t hash;
 
@@ -503,18 +517,20 @@ bool amdgpu_gmc_filter_faults(struct amdgpu_device *adev,
  *
  * Remove the address from fault filter, then future vm fault on this address
  * will pass to retry fault handler to recover.
+ *
+ * The stored key includes the one-bit IH VMID source; the caller does
+ * not know which source faulted, so expire entries for both source domains.
  */
 void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 				     uint16_t pasid)
 {
 	struct amdgpu_gmc *gmc = &adev->gmc;
-	uint64_t key = amdgpu_gmc_fault_key(addr, pasid);
 	struct amdgpu_ih_ring *ih;
 	struct amdgpu_gmc_fault *fault;
 	uint32_t last_wptr;
 	uint64_t last_ts;
-	uint32_t hash;
 	uint64_t tmp;
+	uint32_t vmid_src;
 
 	if (adev->irq.retry_cam_enabled)
 		return;
@@ -532,21 +548,25 @@ void amdgpu_gmc_filter_faults_remove(struct amdgpu_device *adev, uint64_t addr,
 	/* Get the timetamp of the last entry in IH ring */
 	last_ts = amdgpu_ih_decode_iv_ts(adev, ih, last_wptr, -1);
 
-	hash = hash_64(key, AMDGPU_GMC_FAULT_HASH_ORDER);
-	fault = &gmc->fault_ring[gmc->fault_hash[hash].idx];
-	do {
-		if (atomic64_read(&fault->key) == key) {
-			/*
-			 * Update the timestamp when this fault
-			 * expired.
-			 */
-			fault->timestamp_expiry = last_ts;
-			break;
-		}
+	for (vmid_src = 0; vmid_src < 2; vmid_src++) {
+		uint64_t key = amdgpu_gmc_fault_key(addr, pasid, vmid_src);
+		uint32_t hash = hash_64(key, AMDGPU_GMC_FAULT_HASH_ORDER);
 
-		tmp = fault->timestamp;
-		fault = &gmc->fault_ring[fault->next];
-	} while (fault->timestamp < tmp);
+		fault = &gmc->fault_ring[gmc->fault_hash[hash].idx];
+		do {
+			if (atomic64_read(&fault->key) == key) {
+				/*
+				 * Update the timestamp when this fault
+				 * expired.
+				 */
+				fault->timestamp_expiry = last_ts;
+				break;
+			}
+
+			tmp = fault->timestamp;
+			fault = &gmc->fault_ring[fault->next];
+		} while (fault->timestamp < tmp);
+	}
 }
 
 int amdgpu_gmc_handle_retry_fault(struct amdgpu_device *adev,
@@ -576,7 +596,8 @@ int amdgpu_gmc_handle_retry_fault(struct amdgpu_device *adev,
 		/* Process it only if it's the first fault for this address */
 		if (entry->ih != &adev->irq.ih_soft &&
 		    amdgpu_gmc_filter_faults(adev, entry->ih, addr, entry->pasid,
-					     entry->timestamp))
+					     entry->timestamp,
+					     entry->vmid_src))
 			return 1;
 
 		/* Delegate it to a different ring if the hardware hasn't

@@ -102,6 +102,8 @@ struct kgd_mem {
 	uint32_t gem_handle;
 	bool aql_queue;
 	bool is_imported;
+	/* Import alias metadata consumes one BO unit independently of CRIU flags. */
+	bool sandbox_import_charged;
 };
 
 /* KFD Memory Eviction */
@@ -271,6 +273,11 @@ int amdgpu_amdkfd_set_sigbus_delay(struct task_struct *task, u32 ms)
 }
 #endif
 /* Shared API */
+struct amdgpu_sandbox;
+int amdgpu_amdkfd_alloc_kernel_mem_owned(struct amdgpu_device *adev, size_t size,
+				u32 domain, void **mem_obj, uint64_t *gpu_addr,
+				void **cpu_ptr, bool mqd_gfx9, bool is_uswc_mode,
+				struct amdgpu_sandbox *sandbox);
 int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
 				u32 domain, void **mem_obj, uint64_t *gpu_addr,
 				void **cpu_ptr, bool mqd_gfx9, bool is_uswc_mode);
@@ -515,7 +522,7 @@ int kgd2kfd_init_zone_device(struct amdgpu_device *adev)
 /* KGD2KFD callbacks */
 void kgd2kfd_spm_interrupt(struct kfd_dev *kfd, int xcc_id);
 int kgd2kfd_quiesce_mm(struct mm_struct *mm, uint32_t trigger);
-int kgd2kfd_resume_mm(struct mm_struct *mm);
+int kgd2kfd_resume_mm(struct mm_struct *mm, uint32_t trigger);
 int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
 					       u16 context_id, struct dma_fence *fence);
 #if IS_ENABLED(CONFIG_HSA_AMD)

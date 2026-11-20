@@ -29,3 +29,5 @@
 
 #define CREATE_TRACE_POINTS
 #include "amdgpu_trace.h"
+
+#include "amdgpu_lte_trace.h"

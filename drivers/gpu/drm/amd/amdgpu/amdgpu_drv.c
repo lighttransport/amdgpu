@@ -41,6 +41,9 @@
 #include <linux/vga_switcheroo.h>
 
 #include "amdgpu.h"
+#include "amdgpu_sandbox.h"
+#include "amdgpu_lte_debug.h"
+#include <uapi/linux/kfd_ioctl.h>
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_drv.h"
@@ -247,6 +250,7 @@ int amdgpu_user_partt_mode = AMDGPU_AUTO_COMPUTE_PARTITION_MODE;
 int amdgpu_umsch_mm;
 int amdgpu_seamless = -1; /* auto */
 uint amdgpu_debug_mask;
+uint amdgpu_lte_debug;
 int amdgpu_agp = -1; /* auto */
 int amdgpu_wbrf = -1;
 int amdgpu_damage_clips = -1; /* auto */
@@ -802,6 +806,58 @@ MODULE_PARM_DESC(hws_max_conc_proc,
 	"Max # processes HWS can execute concurrently when sched_policy=0 (0 = no concurrency, #VMIDs for KFD = Maximum(default))");
 
 /**
+ * DOC: kfd_queue_priority_cap (int)
+ * Upper bound applied to the HSA priority (0-15) of KFD user queues when they
+ * are created or updated. Priorities 0-6 map to the low CP pipe priority, so a
+ * cap of 0 lets graphics work (compositor, cursor, page flips) win wave launch
+ * arbitration over long-running compute such as miners. -1 (default) disables
+ * the cap. Writable at runtime; it applies to queues created or updated later.
+ */
+int kfd_queue_priority_cap = -1;
+
+static int kfd_queue_priority_cap_set(const char *val, const struct kernel_param *kp)
+{
+	int cap, r;
+
+	/*
+	 * -1 disables the cap; otherwise an HSA priority up to
+	 * KFD_MAX_QUEUE_PRIORITY.  Never fail: a bad modprobe.d value must not
+	 * keep amdgpu (and the display) from loading, so fall back to "off".
+	 */
+	r = kstrtoint(val, 0, &cap);
+	if (r || cap < -1 || cap > KFD_MAX_QUEUE_PRIORITY) {
+		pr_warn("amdgpu: invalid kfd_queue_priority_cap '%s' (-1..%d); cap disabled\n",
+			val, KFD_MAX_QUEUE_PRIORITY);
+		cap = -1;
+	}
+	WRITE_ONCE(*(int *)kp->arg, cap);
+	return 0;
+}
+
+static const struct kernel_param_ops kfd_queue_priority_cap_ops = {
+	.set = kfd_queue_priority_cap_set,
+	.get = param_get_int,
+};
+module_param_cb(kfd_queue_priority_cap, &kfd_queue_priority_cap_ops,
+		&kfd_queue_priority_cap, 0644);
+MODULE_PARM_DESC(kfd_queue_priority_cap,
+	"Max HSA priority for KFD user queues; 0-6 = low CP pipe priority so graphics stays responsive under compute load (-1 = no cap (default), 0-15)");
+
+/**
+ * DOC: kfd_gfx_reserved_cus (int)
+ * Number of CUs that KFD compute queues without an application CU mask
+ * leave free for graphics, so a compute load that fills every CU (e.g. a
+ * miner) cannot starve the compositor into a gfx ring timeout. Rounded up to
+ * whole WGPs and spread across shader arrays; at least one WGP stays
+ * available to compute. 0 (default) disables it. GFX 12.0 only. Read at
+ * module load.
+ */
+int kfd_gfx_reserved_cus;
+module_param(kfd_gfx_reserved_cus, int, 0444);
+MODULE_PARM_DESC(kfd_gfx_reserved_cus,
+	"CUs kept free of KFD compute queues for graphics (0 = off (default); GFX 12.0; rounded to WGPs)");
+
+/**
  * DOC: cwsr_enable (int)
  * CWSR(compute wave store and resume) allows the GPU to preempt shader execution in
  * the middle of a compute wave. Default is 1 to enable this feature. Setting 0
@@ -1123,6 +1179,15 @@ module_param_named(seamless, amdgpu_seamless, int, 0444);
  */
 MODULE_PARM_DESC(debug_mask, "debug options for amdgpu, disabled by default");
 module_param_named_unsafe(debug_mask, amdgpu_debug_mask, uint, 0444);
+
+/**
+ * DOC: lte_debug (uint)
+ * LTE diagnostic trace mask: 1 = SMU protocol, 2 = PM/IP phases, 4 = PPT
+ * writes/read-back. Default 0. Also enable the amdgpu_lte tracefs events.
+ * No extra firmware queries or recovery actions are performed.
+ */
+MODULE_PARM_DESC(lte_debug, "LTE diagnostic trace mask (1=SMU, 2=PM, 4=PPT; default 0)");
+module_param_named(lte_debug, amdgpu_lte_debug, uint, 0444);
 
 /**
  * DOC: agp (int)
@@ -2653,6 +2718,7 @@ amdgpu_pci_remove(struct pci_dev *pdev)
 	struct drm_device *dev = pci_get_drvdata(pdev);
 	struct amdgpu_device *adev = drm_to_adev(dev);
 
+	amdgpu_sb_device_gone(adev);
 	amdgpu_ras_eeprom_check_and_recover(adev);
 	amdgpu_xcp_dev_unplug(adev);
 	amdgpu_gmc_prepare_nps_mode_change(adev);
@@ -2986,6 +3052,7 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct drm_device *drm_dev = pci_get_drvdata(pdev);
 	struct amdgpu_device *adev = drm_to_adev(drm_dev);
+	enum switch_power_state old_power_state = drm_dev->switch_power_state;
 	int ret, i;
 
 	ret = amdgpu_pmops_runtime_checks(dev);
@@ -3017,16 +3084,16 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
 		adev->mp1_state = PP_MP1_STATE_UNLOAD;
 
+	amdgpu_lte_pm_trace(adev, "runtime", "prepare-begin", 0, false);
 	ret = amdgpu_device_prepare(drm_dev);
+	amdgpu_lte_pm_trace(adev, "runtime", "prepare-end", ret, false);
 	if (ret)
-		return ret;
+		goto out;
+	amdgpu_lte_pm_trace(adev, "runtime", "suspend-begin", 0, false);
 	ret = amdgpu_device_suspend(drm_dev, false);
-	if (ret) {
-		adev->in_runpm = false;
-		if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
-			adev->mp1_state = PP_MP1_STATE_NONE;
-		return ret;
-	}
+	amdgpu_lte_pm_trace(adev, "runtime", "suspend-end", ret, false);
+	if (ret)
+		goto out;
 
 	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
 		adev->mp1_state = PP_MP1_STATE_NONE;
@@ -3044,12 +3111,20 @@ static int amdgpu_pmops_runtime_suspend(struct device *dev)
 		/* nothing to do */
 	} else if ((adev->pm.rpm_mode == AMDGPU_RUNPM_BACO) ||
 			(adev->pm.rpm_mode == AMDGPU_RUNPM_BAMACO)) {
-		amdgpu_device_baco_enter(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-enter-begin", 0, false);
+		ret = amdgpu_device_baco_enter(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-enter-end", ret, false);
 	}
 
 	dev_dbg(&pdev->dev, "asic/device is runtime suspended\n");
 
 	return 0;
+out:
+	adev->in_runpm = false;
+	if (adev->pm.rpm_mode == AMDGPU_RUNPM_BOCO)
+		adev->mp1_state = PP_MP1_STATE_NONE;
+	drm_dev->switch_power_state = old_power_state;
+	return ret;
 }
 
 static void amdgpu_restore_umd_profile_pstate_after_runpm(struct amdgpu_device *adev)
@@ -3098,9 +3173,18 @@ static int amdgpu_pmops_runtime_resume(struct device *dev)
 		pci_set_master(pdev);
 	} else if ((adev->pm.rpm_mode == AMDGPU_RUNPM_BACO) ||
 			(adev->pm.rpm_mode == AMDGPU_RUNPM_BAMACO)) {
-		amdgpu_device_baco_exit(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-exit-begin", 0, false);
+		ret = amdgpu_device_baco_exit(adev);
+		amdgpu_lte_pm_trace(adev, "runtime", "baco-exit-end", ret, false);
+		if (ret) {
+			dev_err(dev, "Failed to exit BACO during runtime resume: %d\n",
+				ret);
+			return ret;
+		}
 	}
+	amdgpu_lte_pm_trace(adev, "runtime", "resume-begin", 0, false);
 	ret = amdgpu_device_resume(drm_dev, false);
+	amdgpu_lte_pm_trace(adev, "runtime", "resume-end", ret, false);
 	if (ret) {
 		if (adev->pm.rpm_mode == AMDGPU_RUNPM_PX)
 			pci_disable_device(pdev);
@@ -3134,6 +3218,88 @@ static int amdgpu_drm_release(struct inode *inode, struct file *filp)
 	return drm_release(inode, filp);
 }
 
+static bool amdgpu_sb_file_get(void *data)
+{
+	struct file *file = data;
+
+	return get_file_active(&file) != NULL;
+}
+
+static void amdgpu_sb_file_put(void *data)
+{
+	fput(data);
+}
+
+static int amdgpu_sb_file_evict(void *data)
+{
+	struct file *file = data;
+	struct drm_file *drm_file = file->private_data;
+	struct amdgpu_fpriv *fpriv = drm_file->driver_priv;
+
+	int idx, ret;
+
+	if (!fpriv)
+		return 0;
+	if (!drm_dev_enter(adev_to_drm(fpriv->userq_mgr.adev), &idx))
+		return -ENODEV;
+	ret = amdgpu_userq_sandbox_quarantine(&fpriv->userq_mgr);
+	drm_dev_exit(idx);
+	return ret;
+}
+
+
+/* drm_open_helper publishes both private_data and drm_file::filp only after
+ * ->open_kms returns. Register the weak file owner here, before fd publication.
+ */
+static int amdgpu_drm_open(struct inode *inode, struct file *file)
+{
+	struct drm_file *drm_file;
+	struct amdgpu_fpriv *fpriv;
+	int ret;
+
+	ret = drm_open(inode, file);
+	if (ret)
+		return ret;
+	drm_file = file->private_data;
+	fpriv = drm_file->driver_priv;
+	fpriv->sandbox_client = amdgpu_sb_client_add(fpriv->sandbox, file,
+		amdgpu_sb_file_get, amdgpu_sb_file_put, amdgpu_sb_file_evict);
+	if (IS_ERR(fpriv->sandbox_client)) {
+		ret = PTR_ERR(fpriv->sandbox_client);
+		fpriv->sandbox_client = NULL;
+		amdgpu_drm_release(inode, file);
+		file->private_data = NULL;
+		return ret;
+	}
+	return 0;
+}
+
+long amdgpu_drm_ioctl(struct file *filp,
+		      unsigned int cmd, unsigned long arg)
+{
+	struct drm_file *file_priv = filp->private_data;
+	struct drm_device *dev;
+	long ret;
+
+	dev = file_priv->minor->dev;
+	if (file_priv->driver_priv) {
+		struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
+
+		ret = amdgpu_sb_identity(fpriv->sandbox, drm_to_adev(dev));
+		if (ret)
+			return ret;
+	}
+	ret = pm_runtime_get_sync(dev->dev);
+	if (ret < 0)
+		goto out;
+
+	ret = drm_ioctl(filp, cmd, arg);
+
+out:
+	pm_runtime_put_autosuspend(dev->dev);
+	return ret;
+}
+
 static const struct dev_pm_ops amdgpu_pm_ops = {
 	.prepare = pm_sleep_ptr(amdgpu_pmops_prepare),
 	.complete = pm_sleep_ptr(amdgpu_pmops_complete),
@@ -3161,13 +3327,23 @@ static int amdgpu_flush(struct file *f, fl_owner_t id)
 	return timeout >= 0 ? 0 : timeout;
 }
 
+static int amdgpu_sb_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct drm_file *drm_file = file->private_data;
+	struct amdgpu_fpriv *fpriv = drm_file->driver_priv;
+	int ret;
+
+	ret = amdgpu_sb_check_current(fpriv->sandbox, drm_to_adev(drm_file->minor->dev));
+	return ret ? ret : amdkcl_drm_gem_mmap(file, vma);
+}
+
 static const struct file_operations amdgpu_driver_kms_fops = {
 	.owner = THIS_MODULE,
-	.open = drm_open,
+	.open = amdgpu_drm_open,
 	.flush = amdgpu_flush,
 	.release = amdgpu_drm_release,
-	.unlocked_ioctl = drm_ioctl,
-	.mmap = amdkcl_drm_gem_mmap,
+	.unlocked_ioctl = amdgpu_drm_ioctl,
+	.mmap = amdgpu_sb_mmap,
 	.poll = drm_poll,
 	.read = drm_read,
 #ifdef CONFIG_COMPAT
@@ -3398,8 +3574,17 @@ static int __init amdgpu_init(void)
 			"reporting any bugs unrelated to overdrive.\n");
 	}
 
+	r = amdgpu_sb_init();
+	if (r)
+		goto error_fini_kfd;
+
 	/* let modprobe override vga console setting */
-	return pci_register_driver(&amdgpu_kms_pci_driver);
+	r = pci_register_driver(&amdgpu_kms_pci_driver);
+	if (!r)
+		return 0;
+	amdgpu_sb_fini();
+error_fini_kfd:
+	amdgpu_amdkfd_fini();
 
 error_fini_sync:
 	amdgpu_sync_fini();
@@ -3410,6 +3595,7 @@ static void __exit amdgpu_exit(void)
 {
 	amdgpu_amdkfd_fini();
 	pci_unregister_driver(&amdgpu_kms_pci_driver);
+	amdgpu_sb_fini();
 	amdgpu_unregister_atpx_handler();
 	amdgpu_acpi_release();
 	amdgpu_sync_fini();

@@ -22,6 +22,7 @@
  */
 
 #include <linux/mutex.h>
+#include <linux/delay.h>
 #include <linux/log2.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -41,6 +42,7 @@
 struct mm_struct;
 
 #include "kfd_priv.h"
+#include "amdgpu_sandbox.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_svm.h"
 #include "kfd_trace.h"
@@ -59,6 +61,9 @@ DEFINE_SRCU(kfd_processes_srcu);
 
 /* For process termination handling */
 static struct workqueue_struct *kfd_process_wq;
+
+/* Release retries must not make unrelated process creation wait on them. */
+static struct workqueue_struct *kfd_process_release_wq;
 
 /* Ordered, single-threaded workqueue for restoring evicted
  * processes. Restoring multiple processes concurrently under memory
@@ -765,8 +770,12 @@ int kfd_process_create_wq(void)
 	if (!kfd_restore_wq)
 		kfd_restore_wq = alloc_ordered_workqueue("kfd_restore_wq",
 							 WQ_FREEZABLE);
+	if (!kfd_process_release_wq)
+		kfd_process_release_wq = alloc_workqueue("kfd_release_wq",
+							 WQ_UNBOUND | WQ_MEM_RECLAIM,
+							 0);
 
-	if (!kfd_process_wq || !kfd_restore_wq) {
+	if (!kfd_process_wq || !kfd_restore_wq || !kfd_process_release_wq) {
 		kfd_process_destroy_wq();
 		return -ENOMEM;
 	}
@@ -779,6 +788,10 @@ void kfd_process_destroy_wq(void)
 	if (kfd_process_wq) {
 		destroy_workqueue(kfd_process_wq);
 		kfd_process_wq = NULL;
+	}
+	if (kfd_process_release_wq) {
+		destroy_workqueue(kfd_process_release_wq);
+		kfd_process_release_wq = NULL;
 	}
 	if (kfd_restore_wq) {
 		destroy_workqueue(kfd_restore_wq);
@@ -1244,6 +1257,7 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
 
 	for (i = 0; i < p->n_pdds; i++) {
 		struct kfd_process_device *pdd = p->pdds[i];
+		struct kfd_dev *kfd = pdd->dev->kfd;
 
 		kfd_smi_event_process(pdd, false);
 
@@ -1288,10 +1302,10 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
 			pdd->runtime_inuse = false;
 		}
 
-		atomic_dec(&pdd->dev->kfd->kfd_processes_count);
-
 		kfree(pdd);
 		p->pdds[i] = NULL;
+		if (atomic_dec_and_test(&kfd->kfd_processes_count))
+			wake_up_all(&kfd->process_exit_wait);
 	}
 	p->n_pdds = 0;
 }
@@ -1389,11 +1403,31 @@ static void kfd_process_wq_release(struct work_struct *work)
 	struct kfd_process *p = container_of(work, struct kfd_process,
 					     release_work);
 	struct dma_fence *ef;
+	int r;
 
 	/*
 	 * If GPU in reset, user queues may still running, wait for reset complete.
 	 */
 	kfd_process_wait_gpu_reset_complete(p);
+	kfd_debugfs_remove_process(p);
+	kfd_process_remove_sysfs(p);
+
+	/*
+	 * Keep the process, PDDs and device owners until every SVM PTE and DMA
+	 * mapping is gone. A transient device failure retries this release work;
+	 * a persistent failure deliberately holds device teardown at its process
+	 * count instead of freeing backing still reachable by the GPU.
+	 */
+	r = svm_range_list_fini(p);
+	if (r) {
+		pr_err_ratelimited("retain KFD process %d after SVM drain error %d; retrying release\n",
+				   p->lead_thread->pid, r);
+		msleep(100);
+		if (!queue_work(kfd_process_release_wq, &p->release_work))
+			pr_err_ratelimited("failed to requeue KFD process %d release; retaining owners\n",
+					   p->lead_thread->pid);
+		return;
+	}
 
 	/* Signal the eviction fence after user mode queues are
 	 * destroyed. This allows any BOs to be freed without
@@ -1409,28 +1443,20 @@ static void kfd_process_wq_release(struct work_struct *work)
 	else
 		ida_destroy(&p->id_table);
 
-	kfd_debugfs_remove_process(p);
-
-	/*
-	 * Remove the proc/sysfs entries before destroying PDDs. The removal path
-	 * walks the PDD array and sysfs callbacks dereference PDD fields, so the
-	 * backing data must remain valid until sysfs removal has completed.
-	 */
-	kfd_process_remove_sysfs(p);
-
 	kfd_process_kunmap_signal_bo(p);
 	kfd_process_free_outstanding_kfd_bos(p);
-	svm_range_list_fini(p);
 
 	kfd_process_destroy_pdds(p);
 	dma_fence_put(ef);
 
 	kfd_event_free_process(p);
 
+	mutex_destroy(&p->ttm_restore_lock);
 	mutex_destroy(&p->mutex);
 
 	put_task_struct(p->lead_thread);
-
+	amdgpu_sb_client_del(p->sandbox_client);
+	amdgpu_sb_put(p->sandbox);
 	kfree(p);
 }
 
@@ -1439,7 +1465,7 @@ static void kfd_process_ref_release(struct kref *ref)
 	struct kfd_process *p = container_of(ref, struct kfd_process, ref);
 
 	INIT_WORK(&p->release_work, kfd_process_wq_release);
-	queue_work(kfd_process_wq, &p->release_work);
+	queue_work(kfd_process_release_wq, &p->release_work);
 }
 
 #ifdef HAVE_MMU_NOTIFIER_PUT
@@ -1490,6 +1516,7 @@ void kfd_process_notifier_release_internal(struct kfd_process *p)
 	struct mm_struct *mm = p->mm;
 #endif
 
+	amdgpu_sb_client_quiesce(p->sandbox_client);
 	kfd_process_table_remove(p);
 	cancel_delayed_work_sync(&p->eviction_work);
 	cancel_delayed_work_sync(&p->restore_work);
@@ -1507,13 +1534,8 @@ void kfd_process_notifier_release_internal(struct kfd_process *p)
 	mutex_lock(&p->mutex);
 	/* Block a racing profiler OPEN_STREAM from arming a torn-down process. */
 	p->dlog_teardown = true;
-	/*
-	 * Queues stopped: terminate the target's streams then release the PQM
-	 * sessions. The KFD-owned BO is not freed here (final records stay
-	 * readable on the stream's refs; freed only at the last kref put).
-	 */
+	/* Terminate readers now, but retain session BOs until queue teardown. */
 	kfd_dlog_stream_notify_target_release(p);
-	kfd_dispatch_log_release_process(p);
 	mutex_unlock(&p->mutex);
 
 	/*
@@ -1552,8 +1574,11 @@ void kfd_process_notifier_release_internal(struct kfd_process *p)
 	 * system memory after mmu release notifier callback returns because
 	 * exit_mmap free process memory afterwards.
 	 */
+	mutex_lock(&p->mutex);
 	kfd_process_dequeue_from_all_devices(p);
 	pqm_uninit(&p->pqm);
+	kfd_dispatch_log_release_process(p);
+	mutex_unlock(&p->mutex);
 
 	for (i = 0; i < p->n_pdds; i++) {
 		struct kfd_process_device *pdd = p->pdds[i];
@@ -1833,6 +1858,52 @@ void kfd_process_set_trap_pc_sampling_flag(struct qcm_process_device *qpd,
  * On return the kfd_process is fully operational and will be freed when the
  * mm is released
  */
+static bool kfd_sb_process_get(void *data)
+{
+	struct kfd_process *p = data;
+
+	return kref_get_unless_zero(&p->ref);
+}
+
+static void kfd_sb_process_put(void *data)
+{
+	kfd_unref_process(data);
+}
+
+static int kfd_sb_process_evict(void *data)
+{
+	struct kfd_process *p = data;
+	int i, ret = 0, r;
+
+	if (!mutex_trylock(&p->mutex))
+		return -EAGAIN;
+	if (!p->mm)
+		goto out;
+	for (i = 0; i < p->n_pdds; i++) {
+		struct kfd_process_device *pdd = p->pdds[i];
+		struct amdgpu_device *adev = pdd->dev->adev;
+		int idx;
+
+		if (!drm_dev_enter(adev_to_drm(adev), &idx)) {
+			ret = -ENODEV;
+			continue;
+		}
+		if (!down_read_trylock(&adev->reset_domain->sem)) {
+			ret = -EAGAIN;
+			drm_dev_exit(idx);
+			continue;
+		}
+		r = kfd_sandbox_evict_process_device(pdd);
+		up_read(&adev->reset_domain->sem);
+		drm_dev_exit(idx);
+		if (r)
+			ret = r;
+	}
+out:
+	mutex_unlock(&p->mutex);
+	return ret;
+}
+
 struct kfd_process *create_process(const struct task_struct *thread, bool primary)
 {
 	struct kfd_process *process;
@@ -1847,10 +1918,20 @@ struct kfd_process *create_process(const struct task_struct *thread, bool primar
 
 	kref_init(&process->ref);
 	mutex_init(&process->mutex);
+	mutex_init(&process->ttm_restore_lock);
 	process->mm = thread->mm;
 	process->lead_thread = thread->group_leader;
 	process->n_pdds = 0;
 	process->queues_paused = false;
+	process->sandbox = amdgpu_sb_current(NULL);
+	if (IS_ERR(process->sandbox)) {
+		err = PTR_ERR(process->sandbox);
+		process->sandbox = NULL;
+		goto err_event_init;
+	}
+	err = amdgpu_sb_check(process->sandbox);
+	if (err)
+		goto err_event_init;
 
 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
@@ -1881,6 +1962,14 @@ struct kfd_process *create_process(const struct task_struct *thread, bool primar
 	err = svm_range_list_init(process);
 	if (err)
 		goto err_init_svm_range_list;
+
+	process->sandbox_client = amdgpu_sb_client_add(process->sandbox, process,
+		kfd_sb_process_get, kfd_sb_process_put, kfd_sb_process_evict);
+	if (IS_ERR(process->sandbox_client)) {
+		err = PTR_ERR(process->sandbox_client);
+		process->sandbox_client = NULL;
+		goto err_sb_client;
+	}
 
 	/* alloc_notifier needs to find the process in the hash table */
 	hash_add_rcu(kfd_processes_table, &process->kfd_processes,
@@ -1936,15 +2025,24 @@ err_alloc_id:
 	kfd_process_free_id(process);
 err_register_notifier:
 	hash_del_rcu(&process->kfd_processes);
-	svm_range_list_fini(process);
+err_sb_client:
+	amdgpu_sb_client_del(process->sandbox_client);
+	WARN_ON_ONCE(svm_range_list_fini(process));
+err_init_apertures:
+	/* kfd_init_apertures can fail after creating some PDDs (e.g. a later
+	 * device fails or is skipped), leaving their kfd_processes_count refs
+	 * behind. Fall through the PDD cleanup so device teardown's
+	 * process_exit_wait cannot hang forever on a leaked count.
+	 */
 err_init_svm_range_list:
 	kfd_process_free_outstanding_kfd_bos(process);
 	kfd_process_destroy_pdds(process);
-err_init_apertures:
 	pqm_uninit(&process->pqm);
 err_process_pqm_init:
 	kfd_event_free_process(process);
 err_event_init:
+	amdgpu_sb_put(process->sandbox);
+	mutex_destroy(&process->ttm_restore_lock);
 	mutex_destroy(&process->mutex);
 	kfree(process);
 err_alloc_process:
@@ -1980,6 +2078,7 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_node *dev,
 	pdd->qpd.dqm = dev->dqm;
 	pdd->qpd.pqm = &p->pqm;
 	pdd->qpd.evicted = 0;
+	pdd->qpd.eviction_drain_pending = false;
 	pdd->qpd.mapped_gws_queue = false;
 	mutex_init(&pdd->qpd.doorbell_lock);
 	pdd->process = p;
@@ -2036,6 +2135,12 @@ int kfd_process_device_init_vm(struct kfd_process_device *pdd,
 		return -EBUSY;
 
 	ret = amdgpu_file_to_fpriv(drm_file, &drv_priv);
+	if (ret)
+		return ret;
+	if (drv_priv->sandbox != pdd->process->sandbox ||
+	    !amdgpu_sb_allows(pdd->process->sandbox, pdd->dev->adev))
+		return -EXDEV;
+	ret = amdgpu_sb_check(pdd->process->sandbox);
 	if (ret)
 		return ret;
 	avm = &drv_priv->vm;
@@ -2101,6 +2206,11 @@ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_node *dev,
 	struct kfd_process_device *pdd;
 	int err;
 
+	if (!amdgpu_sb_allows(p->sandbox, dev->adev))
+		return ERR_PTR(-EPERM);
+	err = amdgpu_sb_check(p->sandbox);
+	if (err)
+		return ERR_PTR(err);
 	pdd = kfd_get_process_device_data(dev, p);
 	if (!pdd) {
 		dev_err(dev->adev->dev, "Process device data doesn't exist\n");
@@ -2167,8 +2277,13 @@ int kfd_process_device_create_obj_handle(struct kfd_process_device *pdd,
 		handle = idr_alloc(&pdd->alloc_idr, buf_obj, preferred_id,
 						preferred_id + 1, GFP_KERNEL);
 
-	if (handle < 0)
+	if (handle < 0) {
+		/* The node was published before idr_alloc; unlink it before
+		 * freeing so a later interval-tree walk cannot use freed memory.
+		 */
+		interval_tree_remove(&buf_obj->it, &p->bo_interval_tree);
 		kfree(buf_obj);
+	}
 
 	return handle;
 }
@@ -2332,6 +2447,44 @@ struct kfd_process *kfd_lookup_process_by_id(const struct mm_struct *mm, u16 id)
 	return ret_p;
 }
 
+static int kfd_eviction_owner_from_trigger(u32 trigger,
+					   enum kfd_eviction_owner *owner)
+{
+	switch (trigger) {
+	case KFD_QUEUE_EVICTION_TRIGGER_SVM:
+		*owner = KFD_EVICTION_OWNER_SVM;
+		break;
+	case KFD_QUEUE_EVICTION_TRIGGER_USERPTR:
+		*owner = KFD_EVICTION_OWNER_USERPTR;
+		break;
+	case KFD_QUEUE_EVICTION_TRIGGER_TTM:
+		*owner = KFD_EVICTION_OWNER_TTM;
+		break;
+	case KFD_QUEUE_EVICTION_TRIGGER_SUSPEND:
+		*owner = KFD_EVICTION_OWNER_SUSPEND;
+		break;
+	case KFD_QUEUE_EVICTION_CRIU_CHECKPOINT:
+		*owner = KFD_EVICTION_OWNER_CRIU_CHECKPOINT;
+		break;
+	case KFD_QUEUE_EVICTION_CRIU_RESTORE:
+		*owner = KFD_EVICTION_OWNER_CRIU_RESTORE;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int kfd_process_restore_owned_queues(struct kfd_process_device *pdd,
+					    enum kfd_eviction_owner owner)
+{
+	struct device_queue_manager *dqm = pdd->dev->dqm;
+
+	return dqm->ops.restore_process_queues_ref(dqm,
+						   &pdd->qpd, owner, NULL);
+}
+
 /* kfd_process_evict_queues - Evict all user queues of a process
  *
  * Eviction is reference-counted per process-device. This means multiple
@@ -2340,8 +2493,16 @@ struct kfd_process *kfd_lookup_process_by_id(const struct mm_struct *mm, u16 id)
 int kfd_process_evict_queues(struct kfd_process *p, bool force, uint32_t trigger)
 {
 	int r = 0, r_tmp = 0;
+	enum kfd_eviction_owner owner;
+	bool acquired, retry_owned[MAX_GPU_INSTANCE] = {};
+	int device_ret[MAX_GPU_INSTANCE] = {};
 	int i;
 	unsigned int n_evicted = 0;
+	int ret;
+
+	ret = kfd_eviction_owner_from_trigger(trigger, &owner);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < p->n_pdds; i++) {
 		struct kfd_process_device *pdd = p->pdds[i];
@@ -2350,21 +2511,52 @@ int kfd_process_evict_queues(struct kfd_process *p, bool force, uint32_t trigger
 		kfd_smi_event_queue_eviction(pdd->dev, p->lead_thread,
 					     trigger);
 
-		r_tmp = pdd->dev->dqm->ops.evict_process_queues(pdd->dev->dqm,
-							    &pdd->qpd);
-		/* evict return -EIO if HWS is hang or asic is resetting, in this case
-		 * we would like to set all the queues to be in evicted state to prevent
-		 * them been add back since they actually not be saved right now.
+		r_tmp = pdd->dev->dqm->ops.evict_process_queues_ref(pdd->dev->dqm,
+							    &pdd->qpd, owner,
+							    &acquired, false);
+		retry_owned[i] = acquired;
+		device_ret[i] = r_tmp;
+		/* Overflow may reject acquisition; backend errors otherwise own a ref. */
+		if (acquired)
+			n_evicted++;
+		/* No backend error proves that this device's queues are drained.
+		 * Keep its eviction reference and withhold any caller fence.
 		 */
-		if (r_tmp && r_tmp != -EIO) {
+		if (r_tmp) {
 			dev_err(dev, "Failed to evict process queues\n");
-			r = r_tmp;
-			if (!force)
+			if (!force) {
+				r = r_tmp;
 				goto fail;
+			}
 		}
-		n_evicted++;
 
-		pdd->dev->dqm->is_hws_hang = false;
+		if (!r_tmp || !pdd->dev->kfd->shared_resources.enable_mes)
+			pdd->dev->dqm->is_hws_hang = false;
+	}
+	if (force) {
+		/* Stop every device first, then retry only the failing devices with
+		 * the references acquired above. A retry must never acquire another
+		 * reference for the same in-flight eviction owner.
+		 */
+		for (i = 0; i < p->n_pdds; i++) {
+			struct kfd_process_device *pdd = p->pdds[i];
+			struct device *dev = pdd->dev->adev->dev;
+			typeof(pdd->dev->dqm->ops.evict_process_queues_ref) evict_ref =
+				pdd->dev->dqm->ops.evict_process_queues_ref;
+
+			while (device_ret[i] && retry_owned[i]) {
+				dev_err_ratelimited(dev,
+						    "Failed to drain process queues (%d); retrying with retained eviction reference\n",
+					device_ret[i]);
+				msleep(100);
+				device_ret[i] = evict_ref(pdd->dev->dqm, &pdd->qpd,
+							  owner, &acquired, true);
+			}
+			if (!device_ret[i] && pdd->dev->kfd->shared_resources.enable_mes)
+				pdd->dev->dqm->is_hws_hang = false;
+			if (device_ret[i] && !r)
+				r = device_ret[i];
+		}
 	}
 
 	return r;
@@ -2381,8 +2573,7 @@ fail:
 
 		kfd_smi_event_queue_restore(pdd->dev, p->lead_thread);
 
-		if (pdd->dev->dqm->ops.restore_process_queues(pdd->dev->dqm,
-							      &pdd->qpd))
+		if (kfd_process_restore_owned_queues(pdd, owner))
 			dev_err(pdd->dev->adev->dev,
 				"Failed to restore queues\n");
 
@@ -2393,10 +2584,15 @@ fail:
 }
 
 /* kfd_process_restore_queues - Restore all user queues of a process */
-int kfd_process_restore_queues(struct kfd_process *p)
+int kfd_process_restore_queues(struct kfd_process *p, uint32_t trigger)
 {
 	int r, ret = 0;
+	enum kfd_eviction_owner owner;
 	int i;
+
+	ret = kfd_eviction_owner_from_trigger(trigger, &owner);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < p->n_pdds; i++) {
 		struct kfd_process_device *pdd = p->pdds[i];
@@ -2404,8 +2600,7 @@ int kfd_process_restore_queues(struct kfd_process *p)
 
 		kfd_smi_event_queue_restore(pdd->dev, p->lead_thread);
 
-		r = pdd->dev->dqm->ops.restore_process_queues(pdd->dev->dqm,
-							      &pdd->qpd);
+		r = kfd_process_restore_owned_queues(pdd, owner);
 		if (r) {
 			dev_err(dev, "Failed to restore process queues\n");
 			if (!ret)
@@ -2475,8 +2670,8 @@ void kfd_process_schedule_restore(struct kfd_process *p)
 		delay_jiffies = 0;
 
 	pr_debug("Process pid %d schedule restore work\n", p->lead_thread->pid);
-	if (mod_delayed_work(kfd_restore_wq, &p->restore_work, delay_jiffies))
-		kfd_process_restore_queues(p);
+	/* A doorbell fault queues work; it owns no eviction reference. */
+	mod_delayed_work(kfd_restore_wq, &p->restore_work, delay_jiffies);
 }
 
 static void kfd_process_unmap_doorbells(struct kfd_process *p)
@@ -2550,38 +2745,137 @@ static bool kfd_process_unmap_doorbells_if_idle(struct kfd_process *p)
 	return !busy;
 }
 
+static bool kfd_process_has_ttm_refs(struct kfd_process *p)
+{
+	int i;
+
+	lockdep_assert_held(&p->ttm_restore_lock);
+	for (i = 0; i < p->n_pdds; i++)
+		if (p->pdds[i]->ttm_evicted)
+			return true;
+	return false;
+}
+
+static int kfd_process_evict_ttm(struct kfd_process *p)
+{
+	int i, ret = 0;
+
+	lockdep_assert_held(&p->ttm_restore_lock);
+	if (p->ttm_restore_epoch == U64_MAX)
+		return -EOVERFLOW;
+	p->ttm_restore_epoch++;
+	for (i = 0; i < p->n_pdds; i++) {
+		struct kfd_process_device *pdd = p->pdds[i];
+		bool acquired;
+		int r;
+
+		kfd_smi_event_queue_eviction(pdd->dev, p->lead_thread,
+					     KFD_QUEUE_EVICTION_TRIGGER_TTM);
+		/* A retained reference from a failed attempt must be retried, not
+		 * acquired again: a fresh acquire would inflate the eviction
+		 * counters while the old drain is still pending.
+		 */
+		r = pdd->dev->dqm->ops.evict_process_queues_ref(pdd->dev->dqm,
+							     &pdd->qpd,
+							     KFD_EVICTION_OWNER_TTM,
+							     &acquired,
+							     pdd->ttm_evicted > 0);
+		if (acquired)
+			pdd->ttm_evicted++;
+		if (r && !ret)
+			ret = r;
+	}
+	return ret;
+}
+
+static int kfd_process_restore_ttm(struct kfd_process *p)
+{
+	int i, ret = 0;
+	u64 epoch;
+
+	lockdep_assert_held(&p->ttm_restore_lock);
+	if (!kfd_process_has_ttm_refs(p))
+		return 0;
+
+	/* Failed eviction never authorized BO migration. Its owned references
+	 * can be rolled back without updating BOs or publishing a new fence.
+	 */
+	if (p->ttm_bos_pending && p->kgd_process_info) {
+		epoch = p->ttm_restore_epoch;
+		/* BO validation can wait for eviction work. Never hold its lock
+		 * over that wait; reject a stale validation before consuming refs.
+		 */
+		mutex_unlock(&p->ttm_restore_lock);
+		ret = amdgpu_amdkfd_gpuvm_restore_process_bos(p->kgd_process_info, &p->ef);
+		mutex_lock(&p->ttm_restore_lock);
+		if (ret)
+			return ret;
+		if (epoch != p->ttm_restore_epoch)
+			return -EAGAIN;
+	}
+
+	for (i = 0; i < p->n_pdds; i++) {
+		struct kfd_process_device *pdd = p->pdds[i];
+		unsigned int budget = 64;
+
+		while (pdd->ttm_evicted && budget--) {
+			bool consumed;
+			int r;
+
+			kfd_smi_event_queue_restore(pdd->dev, p->lead_thread);
+			r = pdd->dev->dqm->ops.restore_process_queues_ref(pdd->dev->dqm,
+							       &pdd->qpd,
+							       KFD_EVICTION_OWNER_TTM,
+							       &consumed);
+			if (consumed)
+				pdd->ttm_evicted--;
+			if (r && !ret)
+				ret = r;
+			if (!consumed) {
+				if (!ret)
+					ret = -EAGAIN;
+				break;
+			}
+		}
+	}
+	if (!kfd_process_has_ttm_refs(p))
+		p->ttm_bos_pending = false;
+	return ret;
+}
+
 static void evict_process_worker(struct work_struct *work)
 {
+	struct kfd_process *p = container_of(to_delayed_work(work),
+					   struct kfd_process, eviction_work);
 	int ret;
-	struct kfd_process *p;
-	struct delayed_work *dwork;
 
-	dwork = to_delayed_work(work);
-
-	/* Process termination destroys this worker thread. So during the
-	 * lifetime of this thread, kfd_process p will be valid
-	 */
-	p = container_of(dwork, struct kfd_process, eviction_work);
+	mutex_lock(&p->ttm_restore_lock);
 	trace_kfd_evict_process_worker_start(p);
-
 	p->last_evict_timestamp = get_jiffies_64();
-
-	pr_debug("Started evicting process pid %d\n", p->lead_thread->pid);
-	ret = kfd_process_evict_queues(p, false, KFD_QUEUE_EVICTION_TRIGGER_TTM);
+	ret = kfd_process_evict_ttm(p);
 	if (!ret) {
-		/* If another thread already signaled the eviction fence,
-		 * they are responsible stopping the queues and scheduling
-		 * the restore work.
-		 */
-		if (signal_eviction_fence(p) ||
-		    mod_delayed_work(kfd_restore_wq, &p->restore_work,
-				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
-			kfd_process_restore_queues(p);
-
-		pr_debug("Finished evicting process pid %d\n", p->lead_thread->pid);
-	} else
+		signal_eviction_fence(p);
+		p->ttm_bos_pending = true;
+	} else {
 		pr_err("Failed to evict queues of process pid %d\n", p->lead_thread->pid);
+	}
+	/* Every acquired reference belongs to this worker's ledger. Coalescing
+	 * work neither consumes references nor creates a second owner.
+	 */
+	if (kfd_process_has_ttm_refs(p)) {
+		if (ret)
+			/* Re-drive the failed eviction. The restore path refuses
+			 * queues with a pending drain, so rescheduling only the
+			 * restore worker would spin without ever clearing it.
+			 */
+			mod_delayed_work(kfd_restore_wq, &p->eviction_work,
+					 msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
+		else
+			mod_delayed_work(kfd_restore_wq, &p->restore_work,
+					 msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
+	}
 	trace_kfd_evict_process_worker_end(p, ret ? "Failed" : "Success");
+	mutex_unlock(&p->ttm_restore_lock);
 }
 
 static int restore_process_helper(struct kfd_process *p)
@@ -2596,7 +2890,8 @@ static int restore_process_helper(struct kfd_process *p)
 			return ret;
 	}
 
-	ret = kfd_process_restore_queues(p);
+	ret = kfd_process_restore_queues(p,
+					 KFD_QUEUE_EVICTION_TRIGGER_SUSPEND);
 	if (!ret)
 		pr_debug("Finished restoring process pid %d\n",
 			p->lead_thread->pid);
@@ -2609,63 +2904,43 @@ static int restore_process_helper(struct kfd_process *p)
 
 static void restore_process_worker(struct work_struct *work)
 {
-	struct delayed_work *dwork;
-	struct kfd_process *p;
-	int ret = 0;
+	struct kfd_process *p = container_of(to_delayed_work(work),
+					   struct kfd_process, restore_work);
+	int ret;
 
-	dwork = to_delayed_work(work);
+	mutex_lock(&p->ttm_restore_lock);
+	/* Stale work must not consume suspend, SVM or quarantine references. */
+	if (!kfd_process_has_ttm_refs(p))
+		goto out;
+	if (kfd_process_unmap_doorbells_if_idle(p))
+		goto out;
 
-	/* Process termination destroys this worker thread. So during the
-	 * lifetime of this thread, kfd_process p will be valid
-	 */
-	p = container_of(dwork, struct kfd_process, restore_work);
-
-	if (kfd_process_unmap_doorbells_if_idle(p)) {
-		pr_debug("Process pid %d queues idle, doorbell unmapped\n",
-			 (int)p->lead_thread->pid);
-		return;
-	}
-
-	pr_debug("Started restoring process pid %d\n", (int)p->lead_thread->pid);
 	trace_kfd_restore_process_worker_start(p);
-
-	/* Setting last_restore_timestamp before successful restoration.
-	 * Otherwise this would have to be set by KGD (restore_process_bos)
-	 * before KFD BOs are unreserved. If not, the process can be evicted
-	 * again before the timestamp is set.
-	 * If restore fails, the timestamp will be set again in the next
-	 * attempt. This would mean that the minimum GPU quanta would be
-	 * PROCESS_ACTIVE_TIME_MS - (time to execute the following two
-	 * functions)
-	 */
-
 	p->last_restore_timestamp = get_jiffies_64();
-
-	ret = restore_process_helper(p);
-	if (ret) {
-		pr_debug("Failed to restore BOs of process pid %d, retry after %d ms\n",
-			 p->lead_thread->pid, PROCESS_BACK_OFF_TIME_MS);
-		if (mod_delayed_work(kfd_restore_wq, &p->restore_work,
-				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
-			kfd_process_restore_queues(p);
-		trace_kfd_restore_process_worker_end(p, ret ?
-					"Rescheduled restore" :
-					"Failed to reschedule restore");
-	} else {
-		trace_kfd_restore_process_worker_end(p, "Success");
-	}
+	ret = kfd_process_restore_ttm(p);
+	if (kfd_process_has_ttm_refs(p))
+		mod_delayed_work(kfd_restore_wq, &p->restore_work,
+				 msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
+	trace_kfd_restore_process_worker_end(p, ret ? "Rescheduled restore" : "Success");
+out:
+	mutex_unlock(&p->ttm_restore_lock);
 }
 
 void kfd_suspend_all_processes(bool force)
 {
 	struct kfd_process *p;
 	unsigned int temp;
+	int ret;
 	int idx = srcu_read_lock(&kfd_processes_srcu);
 
 	WARN(debug_evictions, "Evicting all processes");
 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
-		if (kfd_process_evict_queues(p, force, KFD_QUEUE_EVICTION_TRIGGER_SUSPEND))
+		ret = kfd_process_evict_queues(p, force,
+					       KFD_QUEUE_EVICTION_TRIGGER_SUSPEND);
+		if (ret) {
 			pr_err("Failed to suspend process pid %d\n", p->lead_thread->pid);
+			continue;
+		}
 		signal_eviction_fence(p);
 	}
 	srcu_read_unlock(&kfd_processes_srcu, idx);
@@ -2847,6 +3122,47 @@ int kfd_debugfs_mqds_by_process(struct seq_file *m, void *data)
 	srcu_read_unlock(&kfd_processes_srcu, idx);
 
 	return r;
+}
+
+int kfd_debugfs_qstate_by_process(struct seq_file *m, void *data)
+{
+	struct kfd_process *p;
+	unsigned int temp;
+	int i, idx = srcu_read_lock(&kfd_processes_srcu);
+
+	seq_puts(m, "# echo <pid> > queue_state   re-adds STRANDED queues of an un-evicted process\n");
+	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+		seq_printf(m, "Process %d (%s):\n", p->lead_thread->tgid,
+			   p->lead_thread->comm);
+		mutex_lock(&p->mutex);
+		for (i = 0; i < p->n_pdds; i++)
+			dqm_debugfs_qstate(m, p->pdds[i], false);
+		mutex_unlock(&p->mutex);
+	}
+	srcu_read_unlock(&kfd_processes_srcu, idx);
+	return 0;
+}
+
+int kfd_debugfs_qstate_repair(pid_t pid)
+{
+	struct pid *spid = find_get_pid(pid);
+	struct kfd_process *p;
+	int i, fixed = 0;
+
+	if (!spid)
+		return -ESRCH;
+	p = kfd_lookup_process_by_pid(spid);
+	put_pid(spid);
+	if (!p)
+		return -ESRCH;
+	mutex_lock(&p->mutex);
+	for (i = 0; i < p->n_pdds; i++)
+		fixed += dqm_debugfs_qstate(NULL, p->pdds[i], true);
+	mutex_unlock(&p->mutex);
+	kfd_unref_process(p);
+	pr_info("kfd queue_state: pid %d: re-added %d stranded queue(s)\n",
+		pid, fixed);
+	return fixed;
 }
 
 #endif

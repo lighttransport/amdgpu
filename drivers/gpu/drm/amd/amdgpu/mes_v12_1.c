@@ -1777,6 +1777,12 @@ static int mes_v12_1_xcc_hw_init(struct amdgpu_ip_block *ip_block, int xcc_id)
 	/* Enable the MES to handle doorbell ring on unmapped queue */
 	mes_v12_1_enable_unmapped_doorbell_handling(&adev->mes, true, xcc_id);
 
+	/* Firmware queue state for this pipe is gone after the reload. KFD uses
+	 * this generation to skip REMOVE_QUEUE for queues that predate a reinit;
+	 * without it the 12.1 backend keeps the stale generation forever.
+	 */
+	atomic_inc(&adev->mes.fw_generation);
+
 	r = mes_v12_1_queue_init(adev, AMDGPU_MES_SCHED_PIPE, xcc_id);
 	if (r)
 		goto failure;

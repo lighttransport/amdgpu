@@ -66,16 +66,49 @@ static inline struct v12_sdma_mqd *get_sdma_mqd(void *mqd)
 }
 
 static void update_cu_mask(struct mqd_manager *mm, void *mqd,
+			   struct queue_properties *q,
 			   struct mqd_update_info *minfo)
 {
 	struct v12_compute_mqd *m;
 	uint32_t se_mask[KFD_MAX_NUM_SE] = {0};
+	uint32_t reserve_mask[4];
+	const uint32_t *cu_mask;
+	uint32_t count;
 
-	if (!minfo || !minfo->cu_mask.ptr)
-		return;
+	if (minfo && minfo->cu_mask.ptr) {
+		cu_mask = minfo->cu_mask.ptr;
+		count = minfo->cu_mask.count;
+	} else {
+		/* Application and debugger masks win over the graphics reservation. */
+		if (q->type != KFD_QUEUE_TYPE_COMPUTE ||
+		    q->is_user_cu_masked || q->is_dbg_wa)
+			return;
+		/*
+		 * Cooperative (GWS) queues size grids for every CU; a reduced
+		 * mask could leave grid-barrier workgroups unable to become
+		 * resident. Restore the full mask, which GWS may be enabled on
+		 * after the default reservation was applied.
+		 */
+		if (q->is_gws) {
+			m = get_mqd(mqd);
+			m->compute_static_thread_mgmt_se0 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se1 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se2 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se3 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se4 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se5 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se6 = 0xFFFFFFFF;
+			m->compute_static_thread_mgmt_se7 = 0xFFFFFFFF;
+			return;
+		}
+		count = mqd_gfx_reserved_cu_mask(mm, reserve_mask,
+						 ARRAY_SIZE(reserve_mask));
+		if (!count)
+			return;
+		cu_mask = reserve_mask;
+	}
 
-	mqd_symmetrically_map_cu_mask(mm,
-		minfo->cu_mask.ptr, minfo->cu_mask.count, se_mask, 0);
+	mqd_symmetrically_map_cu_mask(mm, cu_mask, count, se_mask, 0);
 
 	m = get_mqd(mqd);
 	m->compute_static_thread_mgmt_se0 = se_mask[0];
@@ -273,7 +306,7 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
 	if (mm->dev->kfd->cwsr_enabled)
 		m->cp_hqd_ctx_save_control = 0;
 
-	update_cu_mask(mm, mqd, minfo);
+	update_cu_mask(mm, mqd, q, minfo);
 	set_priority(m, q);
 
 	if (dispatch_record_supported_v12(mm->dev)) {

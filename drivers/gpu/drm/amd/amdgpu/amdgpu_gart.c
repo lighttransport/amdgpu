@@ -169,6 +169,7 @@ int amdgpu_gart_table_ram_alloc(struct amdgpu_device *adev)
 #endif
 	/* Create SG BO */
 	memset(&bp, 0, sizeof(bp));
+	bp.sandbox_explicit = true;
 	bp.size = adev->gart.table_size;
 	bp.byte_align = PAGE_SIZE;
 	bp.domain = AMDGPU_GEM_DOMAIN_CPU;

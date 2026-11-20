@@ -1,3 +1,294 @@
+AMDGPU LTE fork: build and module parameters
+============================================
+
+The default branch, releases/amd-31.60-lte, contains AMDGPU timeout/recovery,
+SMU power-policy and diagnostic changes, plus experimental cgroup-owned GPU
+sandbox controls. The sandbox implementation is in driver commit af3f47b9d;
+its live container/GPU validation remains outstanding. Controls default off.
+The upstream Linux README is retained below.
+
+Build the packaged AMDGPU modules
+--------------------------------
+
+This repository is a full kernel source tree. Running make at its root builds
+a kernel; the tested out-of-tree driver workflow instead overlays the changed
+sources onto AMD's packaged amdgpu-dkms source tree. Do not copy the whole
+AMD directory over the package: the package has its own compatibility/build
+layout.
+
+The companion Pearl checkout contains the checksum-pinned source stager,
+DKMS installer/rollback workflow, host helper and validation fixtures at
+``tools/gpu-sandbox/``. Those tools are in Pearl, not in this repository.
+Use a Pearl checkout containing the experimental helper commits, whose
+``driver/manifest.json`` pins driver commit
+``af3f47b9d355dc51fc901c193ea25f3fe4e84c47``. The separate production installer
+under ``miner/pearlhash-native/tools/amdgpu/`` pins the earlier non-sandbox
+revision; it does not install the experimental sandbox driver.
+
+Prerequisites: packaged source ``amdgpu-7.1.9-2407772.24.04``, matching target
+kernel headers, GCC/build tools, Git and Python 3; DKMS is additionally needed
+for installation. The target external-module build passed on x86_64 with
+``7.0.0-42-generic``. Other kernels need their own build and runtime checks.
+
+Build as a normal user, using a new source output directory::
+
+    PEARL_CHECKOUT=/path/to/pearl
+    python3 "$PEARL_CHECKOUT/tools/gpu-sandbox/driver/overlay.py" stage \
+      --stock /usr/src/amdgpu-7.1.9-2407772.24.04 \
+      --output /tmp/amdgpu-lte-source &&
+    amdgpu_build_dir=$(mktemp -d /tmp/amdgpu-lte-build.XXXXXX) &&
+    cp -a /tmp/amdgpu-lte-source/. "$amdgpu_build_dir/" &&
+    (cd "$amdgpu_build_dir" && make KERNELVER="$(uname -r)" num_cpu_cores=8)
+
+The stager rejects existing output directories and verifies the packaged-base
+and resulting source hashes. Build a disposable copy because the vendor
+pre-build step rewrites CONFIG names and generates compatibility headers.
+Building does not install a driver, update initramfs, load a module or start
+the helper. Successful compilation does not establish hardware stability.
+
+For installation, first inspect ``dkms status -m amdgpu`` and choose an already
+cached rollback version for the same kernel/architecture. Preview the explicit
+experimental workflow as your normal user::
+
+    python3 "$PEARL_CHECKOUT/tools/gpu-sandbox/driver/dkms.py" install \
+      --development --dry-run --restore-version YOUR_CACHED_DKMS_VERSION
+
+Review Pearl's ``tools/gpu-sandbox/driver/README.md`` for the live install,
+Secure Boot/signing, loaded-module verification and rollback procedure. Keep
+the exact reviewed bundle and its rollback record. The installer does not
+load/unload the GPU driver, reboot, set module options or start the service;
+the experimental DKMS version has AUTOINSTALL=no.
+
+Fork-specific AMDGPU parameters
+-------------------------------
+
+These are read-only module-load parameters. Kernel command-line spelling is
+``amdgpu.NAME=VALUE``; modprobe configuration uses ``options amdgpu NAME=VALUE``.
+Apply changes at a controlled boot after installing the intended module;
+refresh the target initramfs when needed by the distribution's boot setup.
+
+* ``lte_debug=0`` (default): diagnostic trace mask. Bits 1=SMU, 2=PM and
+  4=PPT; 7 enables all three. This enables trace instrumentation, not a reset
+  workaround. ``tools/gpu/amdgpu-lte-capture.sh`` captures the fork's traces.
+
+* ``smu_etime_streak=3`` (default): consecutive SMU response timeouts before
+  fail-fast behavior. 0 disables streak-based timeout escalation. This does
+  not set the GPU scheduler timeout or disable normal GPU recovery.
+
+* ``min_power_cap=0`` (default): retain the SKU minimum PPT floor. A positive
+  value in watts requests a lower PPT0 floor on discrete Navi 48 only
+  (GC 12.0.1, MP1 14.0.2/14.0.3); APUs, SR-IOV VFs, other IPs and PPT1 retain
+  native policy. For example, 170 permits requesting 180 W when it was below
+  the original floor. It does not set the actual power cap or raise its upper
+  bound. Operation below the SKU floor is experimental and may hang the GPU.
+
+* ``sandbox=0`` (default): no sandbox control device. Explicit ``sandbox=1``
+  enables the privileged versioned control ABI at ``/dev/amdgpu-sandbox``.
+  The connected feature mask is 511; this reports availability, not completed
+  hardware validation. The Pearl host helper is required to create policies
+  and gate container launch. This is shared-GPU runaway containment, without
+  hostile-tenant hard isolation or a hard GPU-time quota.
+
+Example diagnostic/power-floor kernel command line::
+
+    amdgpu.lte_debug=7 amdgpu.smu_etime_streak=3 amdgpu.min_power_cap=170
+
+Equivalent modprobe configuration line::
+
+    options amdgpu lte_debug=7 smu_etime_streak=3 min_power_cap=170
+
+For controlled sandbox validation, additionally opt in with
+``amdgpu.sandbox=1`` on the kernel command line (or ``sandbox=1`` on the
+options line). Installation alone does not enable it.
+
+After boot, compare the module on disk with the loaded source identity and
+check the effective parameters::
+
+    modinfo -n amdgpu
+    modinfo -F srcversion amdgpu
+    cat /sys/module/amdgpu/srcversion
+    cat /sys/module/amdgpu/parameters/lte_debug
+    cat /sys/module/amdgpu/parameters/smu_etime_streak
+    cat /sys/module/amdgpu/parameters/min_power_cap
+    cat /sys/module/amdgpu/parameters/sandbox
+
+The two srcversion values should match the verified candidate. ``modinfo``
+alone describes the disk module; absent parameters can indicate an older
+loaded driver. ``modinfo -p amdgpu`` lists all supported module parameters.
+For a 170 W floor, the selected GPU's ``power1_cap_min`` should report
+170000000 microwatts; verify the actual cap separately through ``power1_cap``.
+Locate the hwmon directory by the selected PCI device, rather than assuming
+a fixed hwmon index.
+
+
+Container GPU sandbox support (experimental)
+-------------------------------------------
+
+The driver and Pearl helper implement shared-GPU containment of accidental
+runaway headless graphics and ROCm/HIP workloads. Supported source paths are
+rootful Docker, rootful Podman and rootless Podman. Rootless Docker is deferred.
+Real runtime startup, cgroup/BPF behavior and GPU fault/recovery tests remain
+unverified; the feature mask is not a statement that those tests passed.
+
+Architecture and requirements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* Enable ``amdgpu.sandbox=1`` at a controlled boot of the reviewed driver.
+  The root-only control device uses a versioned ABI and requires CAP_SYS_ADMIN
+  in the initial user namespace. Containers do not receive this control node.
+
+* Run the root-owned Pearl helper service on a unified cgroup v2 host with
+  memory, pids and dmem controllers, writable delegation and cgroup device
+  BPF support. The supplied systemd unit uses DelegateSubgroup=daemon and
+  preserves workload cgroups on helper restart. Host RAM/swap/process limits
+  and the driver policy are configured outside the payload's control.
+
+* A root daemon manages all three runtime paths. Rootful launches require a
+  root caller. Rootless Podman requires an explicitly allowed host UID in
+  /etc/default/gpu-sandbox, a usable user namespace/runtime setup, existing
+  device permissions and /usr/bin/crun. Its image must exist in that user's
+  image store. Rootful Podman and Docker use their respective stores.
+
+* Launch through ``gpu-sandbox run``. The helper creates the policy/device
+  restrictions, forces a trusted static gate as the container entrypoint,
+  verifies the init PID and final cgroup/GPU footprint, then authenticates
+  payload release. A missing capability, failed readback or missing gate
+  prevents release. An ordinary ``docker run --device ...`` does not create
+  a sandbox policy or provide this launch gate.
+
+* The device filter allows basic container character devices, the selected
+  render node and, with ``--compute``, the discovered KFD node. KFD's major
+  number is dynamic. Driver ownership checks constrain use of that shared
+  KFD interface to the selected GPU. Passing the whole /dev/dri directory or
+  enabling privileged containers is not part of the helper interface.
+
+Policy ownership and resource controls
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each policy references one cgroup subtree and one PCI GPU, with immutable
+limits and identity. Nested or overlapping policies are rejected. Existing
+clients/allocations retain their captured owner across kernel workers and
+process movement; moving a caller does not transfer its old objects into a
+new budget. DRM/KFD descriptor boundaries and DMA-BUF/KFD IPC imports reject
+foreign or unmanaged owners; sharing within the same policy is supported.
+
+The connected driver features are OWNERSHIP, BO, VRAM, PINNED, CONTEXTS,
+LEGACY, USERQ, KFD and FAULTS (combined mask 511). Their controls cover:
+
+* VRAM physical residency; total BO bytes and BO/count metadata, including
+  owned VM page tables and private KFD/MES queue/process allocations.
+* Per-mm union reservations for overlapping userptr/SVM ranges. This is a
+  conservative virtual reservation budget, not an exact pinned-RSS meter.
+  Registration and KFD import-alias metadata also consume BO units.
+* Client roots and DRM contexts, DRM/KFD direct queues, and outstanding
+  legacy scheduler jobs. A direct queue is not a GPU-time reservation.
+* Host RAM, swap and process count through cgroup v2; native dmem VRAM limits
+  plus captured-owner driver VRAM accounting for worker allocations.
+
+Defaults are 4096 BO units, 64 context units, 64 direct queues, 256 outstanding
+legacy jobs and 512 processes. Client roots also consume context units. Byte
+budgets are explicit and page aligned; the example below uses 2 GiB VRAM,
+4 GiB BO bytes, 1 GiB pinned reservations, 4 GiB RAM and no swap. Replace the
+PCI address with the selected GPU's full lowercase BDF::
+
+    {
+      "gpu": "0000:0b:00.0",
+      "mode": "observe",
+      "vram_bytes": 2147483648,
+      "buffer_bytes": 4294967296,
+      "pinned_bytes": 1073741824,
+      "ram_bytes": 4294967296,
+      "swap_bytes": 0,
+      "max_bos": 4096,
+      "max_contexts": 64,
+      "max_queues": 64,
+      "max_jobs": 256,
+      "max_pids": 512,
+      "fault_threshold": 3,
+      "fault_window_ms": 60000
+    }
+
+``observe`` is the default: record predicted limit violations, keep helper
+memory/dmem/process limits unlimited, and do not automatically terminate a
+workload for fault/device-loss events. Device restrictions, ownership checks,
+the gate and explicit operator stop still apply. ``enforce`` applies numeric
+limits and rejects admissions exceeding driver budgets. Change the policy's
+mode explicitly to opt in; a new workload/policy is needed to change limits.
+
+Quarantine, recovery and helper restart
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In enforce mode, the default threshold is three distinct attributable GPU
+incidents in 60 seconds. Fence/queue identities deduplicate repeated reports;
+unknown ownership does not justify terminating another policy. Quarantine
+blocks new objects/submissions and queue restore, with targeted DRM/KFD queue
+eviction and retry on incomplete removal. The host helper sends TERM and,
+after at most two seconds of grace, uses cgroup.kill on that policy subtree.
+Explicit ``stop`` requests the same quarantine/termination in either mode.
+
+The targeted helper path does not request a whole-GPU reset. Normal driver
+recovery remains available and may still affect clients sharing the GPU.
+Existing BOs can be relocated during quarantine within the VRAM ceiling;
+TTM can fall back to GTT. Temporary source and destination residency both
+count, so a VRAM-to-VRAM move can require spare budget.
+
+Kernel policies/counters and attached device restrictions survive daemon
+failure. A durable host journal and authoritative kernel inventory support
+restart reconciliation and event-gap detection. Quarantine is irreversible
+for a policy; restarting work requires a new container/policy. Policy retirement
+waits for the empty cgroup to be removed and outstanding driver references to
+be released.
+
+Controlled usage and validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Build/review/install the helper bundle using Pearl's
+``tools/gpu-sandbox/README.md`` and the driver workflow above. Its installer
+neither enables nor starts the service. After the controlled driver boot,
+run ``sudo gpu-sandbox doctor``; it checks ABI/controller availability, not
+GPU isolation or runtime correctness. The isolated privileged cgroup/BPF test
+is documented in the helper README and should precede container/GPU tests.
+
+Save the example as policy.json and check its schema/defaults as a normal
+user::
+
+    gpu-sandbox validate-policy policy.json
+
+After service configuration/start, example rootful Podman graphics and
+Docker HIP launches are below. The reviewed image must contain the compiled
+fixtures, compatible GPU userspace libraries and /usr/bin/timeout::
+
+    sudo gpu-sandbox run --runtime podman --policy policy.json \
+      --image YOUR_REVIEWED_IMAGE -- \
+      /usr/bin/timeout 90 /opt/fixtures/vulkan-smoke --run-seconds 60
+
+    sudo gpu-sandbox run --runtime docker --compute --policy policy.json \
+      --image YOUR_REVIEWED_IMAGE -- \
+      /usr/bin/timeout 90 /opt/fixtures/hip-smoke --run-seconds 60
+
+For rootless Podman, run as the allowed non-root host user, use
+``--runtime rootless-podman`` without sudo, and use that user's image store.
+Add ``--compute`` for HIP. ``run`` returns launch metadata, not the payload's
+completion status; capture runtime logs/wait results using the returned exact
+container ID while it is active, before automatic finished-container cleanup.
+Operator commands use the returned sandbox name::
+
+    sudo gpu-sandbox status --name SANDBOX_NAME
+    sudo gpu-sandbox events --name SANDBOX_NAME
+    sudo gpu-sandbox stop SANDBOX_NAME
+
+Rootless owners use these commands without sudo for their own sandboxes.
+Pearl's ``tools/gpu-sandbox/fixtures/README.md`` documents bounded graphics/HIP
+readback payloads and active concurrency/restart checks. Its
+``VERIFICATION.md`` and ``PREPUSH-AUDIT-2026-11-06.md`` record the remaining
+live cgroup, runtime, sharing, fault, recovery and multi-client test gates.
+
+This does not provide hostile-tenant hard isolation, dedicated hardware
+partitions, a hard GPU-time quota, or assurance that an unrecoverable hardware
+hang cannot affect the host. Container/GPU execution and the complete live
+containment behavior have not been validated in this implementation session.
+
+
 Linux kernel
 ============
 

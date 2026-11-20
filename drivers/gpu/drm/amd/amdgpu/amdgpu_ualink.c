@@ -4198,7 +4198,8 @@ int amdgpu_ualink_manager_start(struct amdgpu_device *adev)
 {
 	int i, r;
 
-	r = amdgpu_vm_init(adev, &adev->ualink.npa_vm, 0);
+	/* Device-owned NPA VM: no client sandbox policy owner. */
+	r = amdgpu_vm_init(adev, &adev->ualink.npa_vm, 0, NULL);
 	if (r)
 		goto out;
 

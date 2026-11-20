@@ -11,6 +11,7 @@ Next (GCN), Radeon DNA (RDNA), and Compute DNA (CDNA) architectures.
    ring-buffer
    amd-hardware-list-info
    module-parameters
+   lte-prepush-audit
    gc/index
    display/index
    userq

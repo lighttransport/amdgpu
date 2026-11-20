@@ -45,7 +45,10 @@ struct amdgpu_ctx_entity {
 	struct dma_fence	*fences[];
 };
 
+struct amdgpu_sandbox;
+
 struct amdgpu_ctx {
+	struct amdgpu_sandbox *sandbox;
 	struct kref			refcount;
 	spinlock_t			ring_lock;
 	unsigned			reset_counter;

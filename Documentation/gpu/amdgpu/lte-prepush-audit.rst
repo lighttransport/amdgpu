@@ -68,19 +68,20 @@ Validation
   script tests pass; the installer dry run stops at the missing stock
   source because the 31.70 package is not installed on this machine.
 
-Pre-push blocker
-----------------
+Accepted shallow-history deviation
+----------------------------------
 
 This checkout was created with shallow fetches; ``.git/shallow`` lists
 both ``f818e1c3`` and the old 31.60 base. The port branch therefore has
-only two commits of local ancestry, with the 31.70 base as a parentless
-shallow root. The lighttransport ``origin`` has neither the 31.70 tag
-nor a 31.70 branch, so a plain ``git push`` would publish a truncated
-history. Before pushing, either unshallow the upstream fetch (full
-history for ``releases/amd-31.70``) or first mirror the upstream 31.70
-tag/branch into ``origin`` and then push the LTE branch on top of it.
-Re-audit the ancestry with ``git rev-list --count`` and
-``git log --oneline origin/releases/amd-31.70..HEAD`` after doing so.
+only a short local ancestry, with the 31.70 base as a parentless shallow
+root. The lighttransport ``origin`` has neither the 31.70 tag nor a 31.70
+branch, so publishing the branch makes ``f818e1c3`` a root commit on the
+remote and truncates upstream history at that point. The operator
+explicitly accepted this deviation for the experimental branch. If the
+branch later becomes a canonical base, repair the history by fetching
+full upstream 31.70 ancestry and rebasing/merging the LTE commits onto
+it, then verify with ``git rev-list --count`` and
+``git log --oneline origin/releases/amd-31.70..HEAD``.
 
 Residual limits
 ---------------

@@ -1,261 +1,92 @@
-LTE fork pre-push audit, 2026-10-31
-===================================
+============================================
+ LTE fork pre-push audit, 2026-11-20 (31.70)
+============================================
 
 Scope
 -----
 
-Reviewed the ten LTE commits from packaged baseline
-``820212794d184710298efcecce42c0215bfc9c6a`` through ``32d19bf4c``.
+Reviewed the single LTE port commit ``34dc8654`` on top of upstream
+``amdgpu-31.70`` ``f818e1c3fa05eb652ece8680f63a5eae22daadba`` on branch
+``releases/amd-31.70-lte-qtrace``. The patch set was replayed from the
+31.60 fork tip ``fa4199e5c``; eight 3-way merge conflicts were resolved
+in ``amdgpu_amdkfd_gpuvm.c``, ``amdgpu_drv.c``, ``amdgpu_gem.c``,
+``amdgpu_userq.h``, ``amdgpu_vm_pt.c``, ``gmc_v12_1.c``,
+``kfd_device.c`` and ``kfd_device_queue_manager.c``.
+
 This is an experimental fork review, not upstream acceptance or a claim
-that firmware/hardware failures cannot hang the GPU. No driver was loaded,
-installed or tested against live hardware during this audit.
+that firmware/hardware failures cannot hang the GPU. No driver was
+installed, loaded or tested against live hardware during this audit.
 
-Corrected findings
-------------------
+Findings and corrections
+------------------------
 
-* ``0e5882894`` packed four source bits into the fault key. GC 12.1 IVs
-  carry up to 57 address bits, so shifting the page number by 20 discarded
-  address bit 56. Distinct retry faults could deduplicate incorrectly.
-  The IH decoder supplies a one-bit VMID source, not a physical VMHUB ID.
-  Pack that bit, all 16 PASID bits and all 45 page-number bits; expiration
-  now visits both source domains instead of sixteen buckets.
-* ``a2bd71fb8`` replaced the asynchronous send's early exit with a loop
-  break. That fell through to output-register reads despite not waiting
-  for command completion. Restore the common unlock/return path immediately
-  after asynchronous submission, preserving split send/wait semantics.
-* ``0d4652c87`` cast the untrusted u32 PPT read-back to int before subtraction
-  and abs(). A firmware value of 0x80000000 provokes signed-overflow UB.
-  Compare the unsigned magnitude of the difference instead.
-* The capture helper inherited tracefs overwrite policy. An instance set
-  to stop-on-full could lose the actual hang evidence. Explicitly select
-  overwrite mode and validate/normalize buffer sizes as bounded decimal
-  input, including leading-zero inputs.
-* Regression harnesses previously lived only in a separate workspace.
-  Publish all five offline suites and a standalone runner in this fork.
-  UBSan violations terminate the tests instead of merely printing warnings.
+* The 31.70 tree adds ``amdgpu_ualink.c``, which did not exist when the
+  LTE sandbox ownership change was authored. It called the old
+  3-argument ``amdgpu_vm_init()``; the build failed with "too few
+  arguments". The device-owned NPA VM has no client policy owner, so the
+  call now passes ``NULL`` as the sandbox argument. This was the only
+  defect found by the full build.
+* Upstream 31.70 superseded several older LTE edits; those hunks were
+  dropped rather than force-reapplied: per-xcp ``vram_pinned`` accounting
+  (the fork's old scalar form would not compile), the ``gmc_v12_1``
+  retry-fault path (now centralized in ``amdgpu_gmc.c``, where the LTE
+  hub-aware dedupe key was retained), and the KFD ``device_fini`` /
+  ``device_exit`` split (LTE process teardown and global-reference drop
+  were kept, with the state sampled before the device is freed).
+* The compat-ioctl sandbox check was dropped because upstream removed
+  ``amdgpu_ioc32.c``.
+* The offline reset-guard harness needed the 31.70 scheduler fields
+  (``num_rqs``, ``sched_rq``, ``DRM_SCHED_PRIORITY_KERNEL``); the SMU and
+  LTE-debug harnesses needed the newer ``smu_msg_is_reset_ack`` helper.
 
-The first three regressions were each reproduced on ``32d19bf4c`` before
-correction. The GMC test checks address bit 56 plus forced hash collisions
-and expiration of both domains. The SMU test asserts no output reads on
-an asynchronous request. The PPT test rejects corrupt 0, 0x80000000 and
-0xffffffff read-backs; the old signed calculation fails UBSan.
+Validation
+----------
 
-Reproduce software validation
------------------------------
+* ``tools/gpu/tests/run-tests.sh``: all 13 suites pass (15 PASS groups)
+  with fatal UBSan. The suites compile extracted C functions against
+  mocked hardware/PM dependencies; no root or GPU is required.
+* ``git diff --check``: clean. No conflict markers remain in changed
+  files. Bash syntax and Python byte-compilation of the test tools pass.
+* ``scripts/checkpatch.pl`` on the cumulative diff: 0 errors, 17 warnings
+  (new-file maintainer reminders, test-file SPDX/filename notes,
+  allocation/spelling/style suggestions, and the intentional ENOTSUPP
+  compatibility fallback). All reviewed.
+* Build-only compile of the actual 31.70 DKMS package source
+  (``amdgpu-dkms 1:7.2.3.31700000-2428518.26.04``) with all 71 changed
+  fork files overlaid as ``amd/*``: EXIT 0 for both
+  ``7.0.0-43-generic`` and ``7.0.0-44-generic``. Nine modules build;
+  ``amdgpu.ko`` reports version ``7.2.3.31700000`` and exports
+  ``lte_debug``, ``smu_etime_streak`` and ``min_power_cap``.
+* All 71 built driver sources match the fork commit byte-for-byte after
+  normalizing the vendor ``_AMDKCL`` CONFIG renames applied by the DKMS
+  pre-build. The packaged ``include/kcl/kcl_version.h`` matches the
+  fork's copy, so the installer's base-source drift check is meaningful.
+* The Pearl installer pin is consistent with this commit:
+  ``dkms_fork_commit`` = ``34dc8654...``, ``dkms_base_commit`` =
+  ``f818e1c3...``, ``dkms_base_version`` = ``7.2.3-2428518.26.04``, and
+  every changed DRM file is in ``dkms_overlay_files``. All 30 DKMS
+  script tests pass; the installer dry run stops at the missing stock
+  source because the 31.70 package is not installed on this machine.
 
-From the checkout, run::
+Pre-push blocker
+----------------
 
-    tools/gpu/tests/run-tests.sh
-
-Requires Python 3, Bash, cc and its UBSan runtime. The tests extract real
-C routines and mock kernel/firmware dependencies. They need neither root
-nor a GPU. Diagnostic tests check gates, event ordering/payload and unchanged
-firmware-call counts. A fake tracefs test covers capture setup/export;
-it does not execute a live kernel trace trigger.
-
-The target build remains the matching ROCm 7.1.9 DKMS package and kernel
-``7.0.0-38-generic``. Build a temporary package-source copy with the fork's
-changed ``drivers/gpu/drm/amd/*`` files overlaid as ``amd/*``. Include the
-new LTE headers, amdgpu.h, amdgpu_ip.c and amdgpu_trace_points.c as well as
-the original GMC/SMU files. Never use an installed-driver tree as the
-scratch build directory. The vendor pre-build renames selected CONFIG
-symbols; that difference is expected, not a source correction.
-
-Audit validation result
------------------------
-
-All five offline suites passed. The first three new regressions fail on
-``32d19bf4c`` and pass with their corrections; the capture fixture also
-verifies overwrite mode and decimal bounds. The full temporary DKMS build
-exited 0 for ``7.0.0-38-generic``, producing nine modules. amdgpu retains
-version ``7.1.9.31600000``. The corrected driver sources match their compiled
-copies byte-for-byte. No compiler warnings originate in those files;
-unrelated KCL/display/compiler notes remain, and BTF is skipped without
-vmlinux. ``git diff --check`` and Bash syntax validation pass. Checkpatch
-reports no errors; existing integer-type and trace-macro style checks and
-the added-file maintainer reminder were reviewed.
+This checkout was created with shallow fetches; ``.git/shallow`` lists
+both ``f818e1c3`` and the old 31.60 base. The port branch therefore has
+only two commits of local ancestry, with the 31.70 base as a parentless
+shallow root. The lighttransport ``origin`` has neither the 31.70 tag
+nor a 31.70 branch, so a plain ``git push`` would publish a truncated
+history. Before pushing, either unshallow the upstream fetch (full
+history for ``releases/amd-31.70``) or first mirror the upstream 31.70
+tag/branch into ``origin`` and then push the LTE branch on top of it.
+Re-audit the ancestry with ``git rev-list --count`` and
+``git log --oneline origin/releases/amd-31.70..HEAD`` after doing so.
 
 Residual limits
 ---------------
 
-* The below-SKU PPT override remains off by default. The earlier RX 9070 XT
-  170 W run caused oracle failures and an SMU hang. Read-back verification
-  detects some failures after a write; it neither rolls back that write
-  nor establishes firmware stability. The default-on timeout policy has
-  software tests but still needs hardware reset/suspend/resume validation.
-* Partial SMU suspend and failed generic unwind still need coordinated
-  device recovery. Do not simply restore software flags or issue blind
-  MMIO to an unconfirmed power domain. Runtime BACO-entry errors are traced
-  but retain the base driver's existing handling policy.
-* The key distinguishes GFXHUB/MMHUB source domains, not every physical
-  hub/XCC/node. It retains the base filter's timestamp/ring synchronization
-  assumptions; the offline test is not a concurrent interrupt stress test.
-* ``AMDGPU_GMC_FAULT_TIMEOUT`` is 5000 IH timestamp ticks. It must not be
-  described as five seconds without establishing the hardware tick period.
-* Trace buffers are RAM only and bounded. Reboot loses them; overwrites are
-  reported in per-CPU statistics. A first-timeout freeze omits later unwind
-  events. Hardware transition timing and live trace-trigger behavior remain
-  unvalidated. Arrange external capture separately for a full host lockup.
-
-The fork branch may be published for experimental review after the corrected
-build/tests pass; that is not approval to install it or run the 170 W test.
-
-
-Previous-boot PCI bus-loss guard, 2026-10-31
-------------------------------------------
-
-The 07:48:55 JST GFX timeout in the previous boot was followed by MES
-queue-command timeouts and unavailable PCI configuration access. The
-journal contains 155 bus-loss reports and 154 failed job recoveries with
-``-ENODEV``. It establishes a recovery storm, not the initial hardware or
-firmware cause; no contemporaneous AER, SMU timeout or VM fault was logged.
-
-The timeout callback now checks physical-device PCI access before dumping
-IP registers and again before full recovery after per-ring reset. A failed
-check parks submission/free workers, restores the removed guilty job under
-the scheduler list lock, cancels queued timeout work and returns
-``DRM_GPU_SCHED_STAT_ENODEV``. The timeout wrapper skips duplicate insertion
-and timer rearm. Parent-fence callbacks remain attached so later completion
-and workqueue restart can release the job. Unlike the older
-``drm_sched_stop()`` path, this does not detach callbacks that the current
-full-reset workqueue restart would not reattach. VF/host FLR behavior
-and present-device recovery paths are unchanged. The guard does not latch
-a permanent unplug state, alter timeout values, or repair the link.
-
-``test-amdgpu-reset-guard.py`` compiles the actual callback, PCI helper and
-scheduler timeout/reinsertion/completion/cleanup functions with mocks and
-fatal UBSan.
-It covers PCI read errors/all-ones responses, early/late loss, completion
-races, job ownership, retained callbacks/later cleanup, healthy-device
-recoveries and VF bypass. The previous
-``1636034a6`` callback fails the first assertion. Kernel concurrency and
-physical recovery remain untested. Each ring is parked on its own timeout;
-this is containment of repeated job recovery, not a device-wide stop of
-all MMIO or a claim that userspace can continue without a reset/rebind.
-
-
-The follow-up full temporary package-source build completed with exit 0
-for ``7.0.0-42-generic``, producing nine modules and retaining amdgpu
-version ``7.1.9.31600000``. The guarded amdgpu_job.c matches the compiled
-copy byte-for-byte, with no compiler warnings in that file. All thirteen
-overlay sources match after expected vendor CONFIG renaming in amdgpu.h
-and amdgpu_drv.c. Existing unrelated warnings remain; BTF was skipped
-without vmlinux. All six driver regression suites pass, including the new
-scheduler/PCI test. No installed sources/modules, live resets, power
-settings or reboot were changed during this follow-up.
-
-
-Guard pre-push review, 2026-10-31
---------------------------------
-
-The live fork remote was read again: LTE branch tip remains
-``1636034a604c7bb56d54a82d29ee99446d559750``. The unpublished guard commit
-is ``3521cd26c14354854f5fe20544815f729bf7c7e6``. The review found no new
-blocking defect in that driver change. In particular, worker cancellation
-precedes guilty-job reinsertion, parent callbacks remain attached, the
-queued timeout is canceled under the list lock, and the ENODEV return
-skips wrapper reinsertion/rearm. Normal full-reset resume starts the same
-workqueues; no timeout or permanent-unplug state was changed.
-
-The previous regression mocked workqueue stop/start as flag toggles and
-used one pending job. The strengthened test extracts the actual stop/start,
-stopped-state and free-queue helpers. Low-level workqueue mocks inject a
-completion and a queued timer while stop waits for in-flight work. It also
-covers two pending jobs, preserved order/parent callbacks, score/credit
-accounting, and exactly-once cleanup after restart. Removing timer cancel,
-reinserting before worker stop, or detaching the parent each makes the
-new regression fail. All six offline driver suites pass with fatal UBSan.
-These are deterministic interleavings, not real kernel concurrency tests.
-
-A separate Pearl integration finding was fixed: post-reboot verification
-could accept matching old loaded/on-disk LTE modules when a stale DKMS
-registration claimed the new version installed. Verification now requires
-nonempty matching srcversion identities for the pinned DKMS build, module
-on disk and loaded module. Reproduced old-verifier acceptance and confirmed
-new-verifier rejection; all seventeen isolated script tests pass.
-
-No driver C source changed during this review. The previous full
-``7.0.0-42-generic`` build remains valid for the thirteen byte-matched
-sources (allowing the vendor's CONFIG renaming), with nine modules and no
-warnings in amdgpu_job.c. The test-only follow-up does not require another
-full rebuild. Driver diff checkpatch and whitespace checks pass.
-
-Residual scope: PCI access can fail after either probe; explicit fault
-interrupts can call drm_sched_fault() even while submission is paused.
-This guard cancels ordinary pending timeout work and suppresses the
-callback wrapper's rearm, not every external trigger or all device MMIO.
-PCI error recovery/PM concurrency, real reset/rebind, firmware timing and
-hardware stability remain unvalidated. No push, install, live reset or
-reboot was performed during the audit.
-
-
-Guard audit round 2, 2026-10-31
--------------------------------
-
-The next pass on baseline f915ad07e found two driver liveness defects:
-
-* An already completed job could still park its queue on a PCI-read error.
-  The callback now bypasses recovery before probing a signaled finished
-  fence, and rechecks completion after a failed first probe. The old
-  completed-job test accepted parking and was corrected; the old callback
-  fails the new assertion. Completion during the first read is covered too.
-* A PCI recovery writer could repair/resume the queue between a failed
-  guard probe and its parking call. Each probe now uses a nonblocking
-  reset-domain read lock, held through parking on failure. A busy writer
-  defers recovery without hardware access. Writers can resume after park,
-  rather than before a stale park. The read lock is dropped before
-  coredump/hive handling and full reset, avoiding inverse lock ordering
-  and read-to-write upgrade. All exits balance the reader.
-
-The deterministic test models domain ownership, writer arrival/resume,
-entry/late contention and unlocked full-reset entry. An early-unlock
-mutation reproduces the wrong final paused state; removing either
-completion check also fails. Existing workqueue/timer, multi-job,
-callback/cleanup and VF checks still pass. All six suites pass with fatal
-UBSan. This is not a kernel race, PCI AER or runtime-PM hardware test.
-
-Separate Pearl integration fixes reuse cached stock modules without
-headers, confirm stock installation before unregistering LTE, and use a
-numbered Pearl DKMS version before the provenance hash. The older hash
-names did not order releases and could select an older registered driver
-on autoinstall. Twenty-two isolated script tests cover these cases.
-
-The guarded source was recompiled and amdgpu.ko relinked for
-7.0.0-42-generic using the existing successful full DKMS build tree's kernel
-module target directly. Nine module artifacts remain, thirteen overlay
-sources match after vendor CONFIG normalization, and amdgpu_job.c emits no
-warnings. Checkpatch and whitespace checks pass. No driver installation,
-push, live reset, power write or reboot was performed.
-
-Final guard review: parked-job teardown
---------------------------------------
-
-Review of tip ``487b5e82a`` found another ownership gap. Bus-loss parking
-stops both submission and free workers. Hardware fence completion alone
-therefore cannot free those pending jobs. AMDGPU did not implement the
-scheduler cancel_job callback, so drm_sched_fini could leave the pending
-list populated and leak the jobs if no reset had restarted the scheduler.
-
-Add amdgpu_job_cancel to the backend operations. Scheduler teardown drains
-submission and timeout work before calling it. It locks the parent fence,
-signals it with -ECANCELED only if still unsignaled, and leaves completed
-results intact. The existing parent callback completes scheduler accounting;
-drm_sched_fini removes and frees the job. Failed submissions have no parent
-and are already finished. The callback performs no MMIO or queue restart.
-
-The regression now extracts drm_sched_fini and its cancellation loop too.
-It covers parked completed/error/unfinished jobs, null-parent failed
-submissions, mixed pending jobs, empty teardown, and completion/free at the
-reset-reader unlock boundary. Freed mock jobs lose their scheduler/fence
-pointers to detect subsequent use. Disabling cancel_job reproduces the
-nonempty-list/zero-frees assertion failure. Six suites pass with fatal
-UBSan; the reset suite also passes Clang ASan+UBSan with leak detection
-disabled because this sandbox prevents LeakSanitizer thread inspection.
-Explicit list/accounting assertions establish the modeled cleanup outcome.
-
-The changed module was compiled and relinked against 7.0.0-42-generic in
-the existing packaged scratch build. This is software validation: it does
-not prove physical PCI/PM recovery, that removal reaches software teardown,
-or that hardware fence draining cannot hang earlier. Existing partial
-suspend unwind, ignored BACO-entry errors and concurrent fault-filter
-limitations remain. No live reset, installation, power change or push.
+No live GPU, reset, suspend/resume, thermal or power-limit test was run;
+the below-212 W PPT option remains an explicitly failed experiment.
+Concurrent firmware/PM race conditions and physical PCI recovery are
+still unvalidated. Software tests and builds do not prove the absence
+of latent defects.
